@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security Vulnerability Report
-    url: https://github.com/dev3Masud/2fa-app/security/advisories/new
+    url: https://github.com/AbdullahProBD/2fa-app/security/advisories/new
     about: Please report security vulnerabilities privately via GitHub Security Advisories.
