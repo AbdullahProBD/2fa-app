@@ -378,33 +378,45 @@ export default function Dashboard() {
     try {
       const target = customGroups.find((g) => g.id === groupId)
       const oldName = target?.name
+      const oldLogo = target?.logo || ''
       const nameChanged = oldName !== undefined && oldName !== newName
-      const logoChanged =
-        typeof newLogo === 'string' && newLogo !== (target?.logo || '')
+      const logoChanged = typeof newLogo === 'string' && newLogo !== oldLogo
 
-      // Persists the name and the icon to localStorage + the database.
+      // Persists the name AND the icon to localStorage + the database. The icon
+      // belongs to the group alone — accounts keep their own logo and fall back
+      // to issuer auto-detection.
       renameCustomGroup(groupId, newName, newLogo)
 
-      if (!nameChanged && !logoChanged) return
+      // Only the name is propagated to member accounts. `logo` is deliberately
+      // NOT sent: a group's icon must not overwrite each account's own icon.
+      if (nameChanged) {
+        setAccounts((prev) =>
+          prev.map((a) => {
+            if (a.group !== oldName && a.group !== newName) return a
+            api.updateAccount(a.id, { group_name: newName }).catch((err) =>
+              console.error('Failed to sync renamed group on server', err)
+            )
+            return { ...a, group: newName }
+          })
+        )
+      }
 
-      // Push the change onto every account in the group so their rows pick up
-      // the new name/icon too. Only the fields that actually moved are sent.
-      setAccounts((prev) =>
-        prev.map((a) => {
-          if (a.group !== oldName && a.group !== newName) return a
-          const updates = {}
-          if (nameChanged) updates.group_name = newName
-          if (logoChanged) updates.logo = newLogo
-          if (Object.keys(updates).length === 0) return a
-          api.updateAccount(a.id, updates).catch((err) =>
-            console.error('Failed to sync renamed group on server', err)
-          )
-          const next = { ...a }
-          if (nameChanged) next.group = newName
-          if (logoChanged) next.logo = newLogo
-          return next
-        })
-      )
+      // Undo the damage from an earlier build that stamped the group's icon onto
+      // every member account: clear it only where it exactly matches the icon
+      // the group used to have, so those rows fall back to issuer detection.
+      // Accounts carrying their own icon are left untouched.
+      if (logoChanged && oldLogo) {
+        setAccounts((prev) =>
+          prev.map((a) => {
+            if (a.group !== (nameChanged ? newName : oldName)) return a
+            if (a.logo !== oldLogo) return a
+            api.updateAccount(a.id, { logo: '' }).catch((err) =>
+              console.error('Failed to clear group icon from account', err)
+            )
+            return { ...a, logo: '' }
+          })
+        )
+      }
     } catch (e) {
       alert(e.message)
     }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 // Categories for icon picker filtering
 export const ICON_CATEGORIES = [
@@ -672,11 +672,22 @@ export function ServiceLogo({
   size = 38,
   className = '',
   style = {},
+  onError,
+  onLoad,
 }) {
   const [imgError, setImgError] = useState(false)
 
   // 1. Explicit URL or data URI
   const isUrl = logo && (logo.startsWith('http') || logo.startsWith('data:'))
+
+  // Reset the failure flag whenever the source changes. Without this, picking a
+  // broken URL (e.g. a host with hotlink protection) permanently latched the
+  // component into the monogram fallback, so every later upload/URL in the same
+  // mounted component silently failed too.
+  useEffect(() => {
+    setImgError(false)
+  }, [logo])
+
   if (isUrl && !imgError) {
     return (
       <div
@@ -700,7 +711,11 @@ export function ServiceLogo({
           alt={issuer || label}
           referrerPolicy="no-referrer"
           loading="lazy"
-          onError={() => setImgError(true)}
+          onLoad={() => onLoad?.(logo)}
+          onError={() => {
+            setImgError(true)
+            onError?.(logo)
+          }}
           style={{ width: '100%', height: '100%', objectFit: 'contain' }}
         />
       </div>
@@ -712,7 +727,10 @@ export function ServiceLogo({
     ? logo
     : detectService(issuer) || detectService(label)
 
-  if (brandKey && BRAND_ICONS[brandKey]) {
+  // A stored URL that failed to load is not a brand key, so skip straight to
+  // the monogram rather than re-detecting a service from the label.
+  const failedUrl = isUrl && imgError
+  if (!failedUrl && brandKey && BRAND_ICONS[brandKey]) {
     const brand = BRAND_ICONS[brandKey]
     return (
       <div

@@ -1,8 +1,15 @@
 import { useState, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faXmark, faMagnifyingGlass, faImage } from '@fortawesome/free-solid-svg-icons'
+import {
+  faXmark,
+  faMagnifyingGlass,
+  faImage,
+  faTriangleExclamation,
+  faSpinner,
+} from '@fortawesome/free-solid-svg-icons'
 import { BRAND_ICONS, ICON_CATEGORIES, ServiceLogo } from '../lib/icons.jsx'
+import { prepareIconUpload, normalizeIconUrl } from '../lib/imageResize.js'
 
 export default function IconPickerModal({
   isOpen,
@@ -16,6 +23,10 @@ export default function IconPickerModal({
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('All')
   const [customUrl, setCustomUrl] = useState('')
+  const [urlError, setUrlError] = useState('')
+  const [previewFailed, setPreviewFailed] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState('')
   const fileRef = useRef()
 
   const filteredIcons = useMemo(() => {
@@ -37,15 +48,54 @@ export default function IconPickerModal({
 
   if (!isOpen) return null
 
-  function handleFileUpload(file) {
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      onSelect(reader.result)
-      onClose()
+  // Validate as the user types so bad input never reaches the API. Only a
+  // well-formed http(s) URL gets previewed.
+  function handleUrlChange(value) {
+    setCustomUrl(value)
+    setPreviewFailed(false)
+    if (!value.trim()) {
+      setUrlError('')
+      return
     }
-    reader.readAsDataURL(file)
+    try {
+      normalizeIconUrl(value)
+      setUrlError('')
+    } catch (e) {
+      setUrlError(e.message)
+    }
   }
+
+  function submitUrl() {
+    let url
+    try {
+      url = normalizeIconUrl(customUrl)
+    } catch (e) {
+      setUrlError(e.message)
+      return
+    }
+    onSelect(url)
+    onClose()
+  }
+
+  async function handleFileUpload(file) {
+    if (!file) return
+    setUploading(true)
+    setUploadError('')
+    try {
+      // Downscaled here so the stored data URI stays well under the server cap.
+      const { dataUrl } = await prepareIconUpload(file)
+      onSelect(dataUrl)
+      onClose()
+    } catch (e) {
+      setUploadError(e.message || 'That image could not be used.')
+    } finally {
+      setUploading(false)
+      // Allow re-picking the same file after a failure.
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  const urlPreviewable = urlError === '' && customUrl.trim() !== ''
 
   const modalContent = (
     <div className="modal-backdrop" onClick={onClose} style={{ zIndex: 1100 }}>
@@ -169,24 +219,48 @@ export default function IconPickerModal({
                 className="input"
                 placeholder="https://example.com/logo.png"
                 value={customUrl}
-                onChange={(e) => setCustomUrl(e.target.value)}
+                onChange={(e) => handleUrlChange(e.target.value)}
                 autoFocus
               />
             </div>
-            {customUrl && (
+
+            {urlError && (
+              <div className="error" style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                <FontAwesomeIcon icon={faTriangleExclamation} style={{ marginTop: 2, flexShrink: 0 }} />
+                <span>{urlError}</span>
+              </div>
+            )}
+
+            {urlPreviewable && !previewFailed && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '14px 0' }}>
-                <ServiceLogo logo={customUrl} size={40} />
+                <ServiceLogo
+                  logo={customUrl.trim()}
+                  size={40}
+                  onError={() => setPreviewFailed(true)}
+                />
                 <span style={{ fontSize: 13, color: 'var(--muted)' }}>Preview</span>
               </div>
             )}
+
+            {/* Many stock-image sites (pngtree, shutterstock, ...) block
+                hotlinking and answer 403 to a third-party <img>. Saying so beats
+                silently showing a monogram after saving. */}
+            {urlPreviewable && previewFailed && (
+              <div className="error" style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                <FontAwesomeIcon icon={faTriangleExclamation} style={{ marginTop: 2, flexShrink: 0 }} />
+                <span>
+                  That image could not be loaded. The host may block hotlinking
+                  or the URL may be wrong. Try uploading the file instead, or use
+                  one of the brand icons.
+                </span>
+              </div>
+            )}
+
             <button
               type="button"
               className="btn btn-primary"
-              disabled={!customUrl.trim()}
-              onClick={() => {
-                onSelect(customUrl.trim())
-                onClose()
-              }}
+              disabled={!urlPreviewable || previewFailed}
+              onClick={submitUrl}
             >
               Use this Image URL
             </button>
@@ -198,16 +272,23 @@ export default function IconPickerModal({
           <div style={{ padding: '8px 0' }}>
             <div
               className="dropzone"
-              onClick={() => fileRef.current?.click()}
+              onClick={() => !uploading && fileRef.current?.click()}
             >
               <div style={{ marginBottom: 6 }}>
-                <FontAwesomeIcon icon={faImage} style={{ fontSize: 28, color: 'var(--muted)' }} />
+                <FontAwesomeIcon
+                  icon={uploading ? faSpinner : faImage}
+                  style={{
+                    fontSize: 28,
+                    color: 'var(--muted)',
+                    animation: uploading ? 'spin 0.8s linear infinite' : undefined,
+                  }}
+                />
               </div>
               <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                Choose an image file
+                {uploading ? 'Preparing image…' : 'Choose an image file'}
               </div>
               <div style={{ fontSize: 12, color: 'var(--muted)' }}>
-                PNG, SVG, JPG, WebP supported
+                PNG, SVG, JPG, WebP supported &middot; resized to 256&times;256
               </div>
               <input
                 ref={fileRef}
@@ -217,6 +298,13 @@ export default function IconPickerModal({
                 onChange={(e) => handleFileUpload(e.target.files?.[0])}
               />
             </div>
+
+            {uploadError && (
+              <div className="error" style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                <FontAwesomeIcon icon={faTriangleExclamation} style={{ marginTop: 2, flexShrink: 0 }} />
+                <span>{uploadError}</span>
+              </div>
+            )}
           </div>
         )}
       </div>

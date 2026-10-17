@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.1.1]
+## [Unreleased]
 
-### Added
+### Fixed
+* **A group's icon no longer overwrites the icons of its member accounts.** Editing a group sent its logo to every account in the group, so all of them adopted the group icon. The group's icon now belongs to the group alone; accounts keep their own logo and fall back to issuer auto-detection. Accounts stamped by the earlier build are cleaned up on the next group icon change (only where the account's logo exactly matched the group's previous icon).
+* **Image upload works.** Two separate bugs: the server silently returned an empty string for any `data:` icon above ~64 KB — which most real logo files exceed, so the upload appeared to succeed and then vanished — and `ServiceLogo`'s error flag never reset when the icon changed, so a single failed image permanently pinned the component to the monogram fallback for every later upload or URL. Uploads are now downscaled to 256×256 in the browser before upload, the server cap is 512 KB, and problems are reported instead of swallowed.
+* **Broken image URLs are reported.** The URL tab now validates input as you type (rejecting non-`http(s)` schemes such as `javascript:`/`data:`) and shows an explicit error when the preview fails to load, instead of quietly saving a dead URL. Sites that block hotlinking (pngtree, shutterstock and similar) answer `403` to third-party `<img>` requests and cannot be made to work — use **Upload File** for those.
 * **Group collapse state is now remembered in the database.** Whether a group is collapsed or expanded is stored in a new `collapsed boolean not null default false` column on `public.groups`, so the accordion layout you left behind is restored on every login and after every toggle. Run the migration below in the Supabase SQL Editor:
 
   ```sql
@@ -21,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## [2.1.0] - 2026-09-30
+
 
 ### Added
 * **Live camera QR scanner.** The Add modal has a new `Scan Camera` tab: rear-camera viewfinder with corner frame + laser animation, ~5 fps `jsQR` scanning, auto-fill + jump to Manual Entry on detect. Handles permission denial, missing camera, and insecure-context (HTTPS/localhost required) with clear errors + retry. No new dependencies.

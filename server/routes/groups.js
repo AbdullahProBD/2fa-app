@@ -8,6 +8,7 @@ import {
   reorderGroupsByUser,
 } from '../lib/supabase.js'
 import { getVaultKeyFromReq, getUserIdFromReq } from '../lib/auth.js'
+import { MAX_LOGO_DATA_URI } from '../lib/limits.js'
 
 const router = Router()
 
@@ -36,7 +37,10 @@ function sanitizeLogo(value) {
   if (typeof value !== 'string') return ''
   const v = value.replace(CTRL_CHARS, '').trim().slice(0, 2048)
   if (!v) return ''
-  if (v.startsWith('data:image/')) return v.length <= 64 * 1024 + 50 ? v : ''
+  // The client downscales uploads to 256x256 before sending, so this ceiling is
+  // generous headroom rather than a limit users hit in practice. It still bounds
+  // what a single row can store.
+  if (v.startsWith('data:image/')) return v.length <= MAX_LOGO_DATA_URI ? v : ''
   if (/^https?:\/\//i.test(v)) {
     try {
       return new URL(v).toString()

@@ -12,6 +12,7 @@ import {
   reorderAccountsByUser,
 } from '../lib/supabase.js'
 import { getVaultKeyFromReq, getUserIdFromReq } from '../lib/auth.js'
+import { MAX_LOGO_DATA_URI } from '../lib/limits.js'
 
 // ── L3 FIX: UUID format validation to prevent malformed IDs reaching DB ───────
 const UUID_RE =
@@ -36,10 +37,12 @@ function normalizeLogo(value) {
   const raw = sanitizeString(value).slice(0, 2048).trim()
   if (!raw) return ''
   if (raw.startsWith('data:image/')) {
-    // Only allow image/* data URIs, max 64KB encoded payload
+    // Only allow well-formed image/* data URIs. The client downscales uploads
+    // to 256x256, so MAX_LOGO_DATA_URI is generous headroom rather than a
+    // ceiling users hit in practice.
     const comma = raw.indexOf(',')
     if (comma === -1) return ''
-    if (raw.length > 64 * 1024 + 50) return ''
+    if (raw.length > MAX_LOGO_DATA_URI) return ''
     return raw
   }
   if (/^https?:\/\//i.test(raw)) {
