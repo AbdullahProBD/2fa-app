@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.1]
+
+### Added
+* **Group collapse state is now remembered in the database.** Whether a group is collapsed or expanded is stored in a new `collapsed boolean not null default false` column on `public.groups`, so the accordion layout you left behind is restored on every login and after every toggle. Run the migration below in the Supabase SQL Editor:
+
+  ```sql
+  alter table public.groups add column if not exists collapsed boolean not null default false;
+  ```
+
+  `PUT /api/groups/:id` now accepts a `collapsed` boolean alongside `name`/`logo` (it rejects anything that isn't a real boolean, and rejects a request that carries no updatable field). Sections with no database row — the `Ungrouped` bucket and auto-derived issuer groups — have nowhere to persist to and are remembered in `localStorage` under `2fa_vault_group_collapsed` instead. Deleting a group clears its stored state so a future group reusing the name starts expanded.
+
+---
+
+## [2.1.0] - 2026-09-30
+
+### Added
+* **Live camera QR scanner.** The Add modal has a new `Scan Camera` tab: rear-camera viewfinder with corner frame + laser animation, ~5 fps `jsQR` scanning, auto-fill + jump to Manual Entry on detect. Handles permission denial, missing camera, and insecure-context (HTTPS/localhost required) with clear errors + retry. No new dependencies.
+* **Screenshot-proof QR upload.** Upload now decodes at multiple scales (1400 → 900 → 480 + center crop) with light/dark inversion attempts, so small codes inside full-screen phone screenshots are found. Server fallback sends a downscaled PNG (originals often exceed the 2 MB cap or are WebP), and the server decoder also tries inverted QRs.
+* **Fully responsive, mobile-first UI.** Sticky mobile header (icon-only actions under 400px), scroll-snap filter pills, tap-to-copy account cards with 44px touch targets, centered dialogs with safe-area padding, 16px inputs (no iOS zoom), `viewport-fit=cover`, touch tuning, and `prefers-reduced-motion` support.
+* **Production metadata & PWA.** SEO/OG/Twitter tags, `theme-color`, `manifest.webmanifest` with 192/512/maskable PNG icons + `apple-touch-icon`, `robots.txt` (`/api/` disallowed), and a README production release checklist.
+* **Vercel security headers.** `vercel.json` now sends HSTS, `nosniff`, `DENY` framing, `no-referrer`, `Permissions-Policy` (camera allowed for self), and a CSP mirroring the Express policy — static hosting matches Express hardening.
+
+### Changed
+* **Camera is now allowed by site permissions.** `Permissions-Policy` is `camera=(self)` (was `camera=()`, which blocked the scanner) in `server/index.js`, `vercel.json`, and the `index.html` meta tag. Microphone/geolocation stay disabled.
+* **CSP allows Vercel Analytics scripts.** `script-src`/`connect-src` include `https://va.vercel-scripts.com` in both Express and Vercel configs.
+* **Mobile modals are centered dialogs** instead of bottom sheets, with side-by-side action buttons.
+
+### Fixed
+* **Page scroll broken by responsive CSS.** `overflow-x: hidden` on `html/body/#root` created a root scroll container and `overscroll-behavior-y: none` killed touch bounce; replaced with `overflow-x: clip` on `body` only. Removed `touch-action: pan-x` from filter pills, which had disabled vertical swipes starting on a pill.
+
+---
+
 ## [2.0.5] - 2026-09-04
 
 ### Added

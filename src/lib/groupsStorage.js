@@ -2,6 +2,7 @@ import { api } from './api.js'
 
 const GROUPS_STORAGE_KEY = '2fa_vault_custom_groups'
 const ACCOUNT_META_KEY = '2fa_vault_account_meta'
+const COLLAPSE_KEY = '2fa_vault_group_collapsed'
 
 // Listeners for multi-component reactive sync
 const listeners = new Set()
@@ -66,6 +67,7 @@ export function syncGroupsFromBackend(backendGroups) {
   })
   const merged = Array.from(map.values())
   saveCustomGroups(merged)
+  applyBackendCollapseState(backendGroups)
   return merged
 }
 
@@ -143,6 +145,10 @@ export function deleteCustomGroup(groupId) {
   const updated = groups.filter((g) => g.id !== groupId)
   saveCustomGroups(updated)
 
+  // Drop the remembered accordion state so a future group that reuses the ID
+  // (or name) doesn't inherit a stale "collapsed" flag.
+  forgetGroupCollapsed(groupId)
+
   // Clear group assignment from accounts in this group
   try {
     const meta = getAllAccountMeta()
@@ -167,6 +173,82 @@ export function deleteCustomGroup(groupId) {
   })
 
   notify()
+}
+
+// ── Group collapse state ─────────────────────────────────────────────────────
+// The database is the source of truth (a `collapsed` column on public.groups),
+// but we also mirror it in localStorage so the very first render after a login
+// shows the correct accordion layout without waiting on the network. Sections
+// that have no database row (the "Ungrouped" bucket and auto-derived issuer
+// groups) are remembered locally only, since there is nowhere to persist them.
+export function getCollapsedMap() {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed
+      }
+    }
+  } catch (e) {
+    console.error('Failed to read group collapse state', e)
+  }
+  return {}
+}
+
+function writeCollapsedMap(map) {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(map))
+  } catch (e) {
+    console.error('Failed to save group collapse state', e)
+  }
+  return map
+}
+
+// Only real, user-created groups exist as rows in public.groups. The synthetic
+// section IDs used by the dashboard must never be written to the API.
+export function isDatabaseGroupId(groupId) {
+  if (typeof groupId !== 'string' || !groupId) return false
+  if (groupId === 'ungrouped' || groupId === 'all') return false
+  if (groupId.startsWith('grp_auto_')) return false
+  return true
+}
+
+export function isGroupCollapsed(groupId, map = getCollapsedMap()) {
+  return map[groupId] === true
+}
+
+// Record a collapsed/expanded toggle in the local mirror. The caller is
+// responsible for pushing the value to the database, so the UI can update
+// synchronously without waiting on the network.
+export function setGroupCollapsed(groupId, collapsed) {
+  const map = getCollapsedMap()
+  map[groupId] = Boolean(collapsed)
+  return writeCollapsedMap(map)
+}
+
+export function forgetGroupCollapsed(groupId) {
+  const map = getCollapsedMap()
+  if (!(groupId in map)) return map
+  delete map[groupId]
+  return writeCollapsedMap(map)
+}
+
+// Overlay the authoritative DB values onto the local cache on login. Groups
+// whose row predates the `collapsed` column come back as `undefined`; we keep
+// whatever the local cache has in that case so nothing is lost.
+function applyBackendCollapseState(backendGroups) {
+  const map = getCollapsedMap()
+  let changed = false
+  backendGroups.forEach((g) => {
+    if (!g || !g.id) return
+    if (typeof g.collapsed !== 'boolean') return
+    if (map[g.id] === g.collapsed) return
+    map[g.id] = g.collapsed
+    changed = true
+  })
+  if (changed) writeCollapsedMap(map)
+  return map
 }
 
 // ── Account metadata (Group + Logo per account) ───────────────────────────

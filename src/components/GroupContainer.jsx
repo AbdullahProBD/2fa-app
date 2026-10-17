@@ -19,6 +19,8 @@ export default function GroupContainer({
   tickerRemaining = {},
   masked = false,
   editMode = false,
+  collapsed: collapsedProp,
+  onCollapseChange,
   onDeleteAccount,
   onUpdateAccount,
   onRenameGroup,
@@ -30,9 +32,24 @@ export default function GroupContainer({
   canMoveGroupDown,
   showGroupArrows = false,
 }) {
-  const [collapsed, setCollapsed] = useState(false)
+  // Collapse state is lifted to the Dashboard (which persists it to the DB) when
+  // `collapsed` is supplied; otherwise the group manages it locally so the
+  // component stays usable on its own.
+  const [collapsedLocal, setCollapsedLocal] = useState(false)
   const [showRenameModal, setShowRenameModal] = useState(false)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
+
+  const isControlled = typeof collapsedProp === 'boolean'
+  const collapsed = isControlled ? collapsedProp : collapsedLocal
+
+  function toggleCollapsed() {
+    const next = !collapsed
+    if (isControlled) {
+      if (typeof onCollapseChange === 'function') onCollapseChange(group, next)
+    } else {
+      setCollapsedLocal(next)
+    }
+  }
 
   const isCustomGroup = Boolean(group.id && group.id !== 'ungrouped' && group.id !== 'all')
   const reorderable =
@@ -49,7 +66,7 @@ export default function GroupContainer({
   return (
     <div className="group-container">
       {/* Group Header */}
-      <div className="group-header" onClick={() => setCollapsed(!collapsed)}>
+      <div className="group-header" onClick={toggleCollapsed}>
         <div className="group-header-left">
           <ServiceLogo
             logo={group.logo}
@@ -122,8 +139,9 @@ export default function GroupContainer({
           {/* Collapse/Expand indicator */}
           <button
             className="group-action-btn"
-            onClick={() => setCollapsed(!collapsed)}
+            onClick={toggleCollapsed}
             title={collapsed ? 'Expand group' : 'Collapse group'}
+            aria-expanded={!collapsed}
           >
             <FontAwesomeIcon
               icon={faChevronDown}

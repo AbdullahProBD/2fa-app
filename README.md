@@ -19,7 +19,9 @@ A modern, self-hosted, zero-knowledge 2FA (TOTP/HOTP) authenticator vault built 
 - **Live TOTP & Countdown Timer** — Epoch-synchronized precision countdown with automated rollover code generation.
 - **Flexible Algorithm Support** — Full support for both TOTP (RFC 6238) and HOTP (RFC 4226) with SHA1, SHA256, SHA512, and 6/7/8 digit codes.
 - **Fast Search & Instant Filter** — Instant fuzzy filtering by account label, issuer, or category with `/` keyboard shortcut.
-- **QR Code Scanner** — Client-side instant camera/image QR scanning, drag-and-drop screenshots, and `otpauth://` URI parsing.
+- **Live Camera QR Scanner** — In-app rear-camera scanner with viewfinder UI (no extra apps). Requires HTTPS (or localhost) + camera permission, which the server allows via `Permissions-Policy: camera=(self)`.
+- **Screenshot-Proof QR Upload** — Drag-and-drop or browse for QR screenshots. Multi-scale + light/dark detection finds small codes inside full-screen phone screenshots (PNG/JPEG/WebP), with a downscaled server fallback and `otpauth://` URI parsing.
+- **Fully Responsive & Mobile-First** — Sticky header with icon-only actions on small phones, tap-to-copy cards with 44px touch targets, centered dialogs, bottom safe-area support, and installable PWA (`manifest.webmanifest` + maskable icons).
 - **Vercel Analytics & Speed Insights** — Integrated web vitals and real-time usage performance analytics.
 - **Database Storage in Supabase Postgres** — Encrypted at rest; service role authorization ensures no public table exposure.
 - **Single-Node Stack** — Express API + React SPA seamlessly unified in a single repository.
@@ -158,6 +160,22 @@ CMD ["npm", "start"]
 
 Visit your deployed URL, sign in with `ADMIN_USER` / `ADMIN_PASS` — the first login creates your user row in Supabase and initializes the vault.
 
+## 🚀 Production release checklist
+
+Before you ship, verify each of these:
+
+1. **Environment** — All required vars set (`SESSION_SECRET` 32+ chars, `ADMIN_USER`, `ADMIN_PASS` 16+ chars, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`). `NODE_ENV=production`, `PORT` as needed. See [`.env.example`](./.env.example).
+2. **Build** — `npm run build` succeeds and `npm start` serves `dist/` (Express) or deploy the repo to Vercel (`vercel.json` rewrites `/api/*` to the serverless function and everything else to `index.html`).
+3. **HTTPS** — Required. Browsers block `getUserMedia` (camera scanner) on insecure origins — HTTPS or `localhost` only. Both Express (HSTS preload) and `vercel.json` send `Strict-Transport-Security`.
+4. **Site permissions** — The app needs `camera=(self)` for the in-app QR scanner; microphone/geolocation stay off. Enforced in two places (keep them in sync):
+   - Express: `Permissions-Policy` header in [`server/index.js`](./server/index.js)
+   - Vercel static hosting: `headers` → `Permissions-Policy` in [`vercel.json`](./vercel.json)
+   - The `<meta http-equiv="Permissions-Policy">` tag in `index.html` is documentation-only (browsers ignore it).
+5. **Security headers** — Helmet + explicit headers on Express; mirrored in `vercel.json` for static hosting: CSP (allows `va.vercel-scripts.com` for Vercel Analytics), `X-Frame-Options: DENY`, `no-referrer`, `nosniff`.
+6. **Metadata & PWA** — `index.html` ships SEO/OG/Twitter tags, `theme-color`, `manifest.webmanifest`, PNG icons + `apple-touch-icon`, and `robots.txt` (`/api/` disallowed). Test "Add to Home Screen" on Android/iOS.
+7. **Camera smoke test** — On the production URL over HTTPS: Add → **Scan Camera** → grant permission → scan a real 2FA QR. Then test **Upload QR Image** with a full-screen phone screenshot.
+8. **Version & notes** — Bump `version` in `package.json` and add a `CHANGELOG.md` entry (Keep a Changelog format).
+
 ## Project structure
 
 ```
@@ -181,11 +199,30 @@ src/                       # React frontend
   main.jsx
   pages/Login.jsx
   pages/Dashboard.jsx
-  components/AccountCard.jsx
-  components/AddAccount.jsx
+  components/AccountCard.jsx      # Tap-to-copy row, live code + countdown
+  components/AddAccount.jsx       # Upload / Scan Camera / URI / Manual tabs
+  components/EditAccountModal.jsx
+  components/DeleteModal.jsx      # 2-step `sudo rm 2fa|group` confirmation
+  components/GroupContainer.jsx
+  components/GroupModal.jsx
+  components/IconPickerModal.jsx
   components/Countdown.jsx
+  components/Select.jsx           # Custom dropdown (replaces <select>)
+  components/Toast.jsx
+  components/Logo.jsx
   lib/api.js
+  lib/groupsStorage.js            # Local group/account order cache
+  lib/icons.jsx                   # 70+ brand logos + auto-detection
   styles.css
+
+public/                    # Static assets (copied to dist/)
+  favicon.svg
+  icon-192.png / icon-512.png / maskable-512.png
+  apple-touch-icon.png
+  manifest.webmanifest     # PWA install metadata
+  robots.txt               # Allows /, disallows /api/
+
+api/index.js               # Vercel serverless entry (imports server/index.js)
 
 supabase-schema.sql        # Run this in Supabase SQL editor
 .env.example               # Copy to .env

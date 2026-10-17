@@ -1,7 +1,7 @@
 {
   "name": "2fa-vault",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently -n server,vite -c cyan,magenta \"npm run dev:server\" \"npm run dev:client\"",

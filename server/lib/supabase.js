@@ -286,6 +286,7 @@ export async function listGroupsByUser(userId) {
             name: gName,
             logo: acc.logo || '',
             position: typeof acc.position === 'number' ? acc.position : 0,
+            collapsed: false,
             created_at: acc.created_at,
           })
         }
@@ -338,11 +339,23 @@ export async function createGroup(userId, group) {
 
 export async function updateGroup(userId, groupId, updates) {
   if (mocks.updateGroup) return mocks.updateGroup(userId, groupId, updates)
-  const sb = getSupabase()
   const payload = {}
   if (updates.name !== undefined) payload.name = updates.name.trim()
   if (updates.logo !== undefined) payload.logo = updates.logo
+  // Accordion state. The column is NOT NULL with a `false` default, so an
+  // explicit write is only needed when the client actually toggles it.
+  if (updates.collapsed !== undefined) payload.collapsed = Boolean(updates.collapsed)
 
+  // Nothing to write (e.g. a request that only carried fields the schema does
+  // not have yet) — echo the current row instead of issuing an empty UPDATE,
+  // which PostgREST rejects.
+  if (Object.keys(payload).length === 0) {
+    const existing = await getGroupById(userId, groupId)
+    if (existing) return existing
+    return { id: groupId }
+  }
+
+  const sb = getSupabase()
   try {
     const { data, error } = await sb
       .from('groups')

@@ -204,6 +204,13 @@ export const api = {
   deleteGroup(id) {
     return request(`/api/groups/${encodeURIComponent(id)}`, { method: 'DELETE' })
   },
+  // PUT /api/groups/:id — persist the accordion (collapsed) state of a group
+  setGroupCollapsed(id, collapsed) {
+    return request(`/api/groups/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ collapsed: Boolean(collapsed) }),
+    })
+  },
   // PATCH /api/groups/reorder — persist new group order to DB
   reorderGroups(orderedIds) {
     return request('/api/groups/reorder', {

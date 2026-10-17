@@ -17,12 +17,17 @@ alter table public.groups add column if not exists position double precision not
 create index if not exists accounts_position_idx on public.accounts(user_id, position);
 create index if not exists groups_position_idx on public.groups(user_id, position);
 
+-- Remembered accordion state: whether a group is collapsed when the user last
+-- left it. Restored on every login and after every toggle.
+alter table public.groups add column if not exists collapsed boolean not null default false;
+
 create table if not exists public.groups (
   id text primary key,
   user_id uuid not null references public.users(id) on delete cascade,
   name text not null,
   logo text not null default '',
   position double precision not null default 0,
+  collapsed boolean not null default false,
   created_at timestamptz not null default now()
 );
 create index if not exists groups_user_id_idx on public.groups(user_id);

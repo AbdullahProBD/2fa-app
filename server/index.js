@@ -52,10 +52,10 @@ app.use(
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
+        scriptSrc: ["'self'", 'https://va.vercel-scripts.com'], // Vercel Analytics / Speed Insights
         styleSrc: ["'self'", "'unsafe-inline'"], // needed for Vite's injected styles
         imgSrc: ["'self'", 'data:', 'https:'],
-        connectSrc: ["'self'", 'https://*.supabase.co', 'https://*.vercel-insights.com', 'https://*.vercel-analytics.com'],
+        connectSrc: ["'self'", 'https://*.supabase.co', 'https://*.vercel-insights.com', 'https://*.vercel-analytics.com', 'https://va.vercel-scripts.com'],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
@@ -75,10 +75,12 @@ app.use(
 )
 
 // ── M5 FIX: Additional headers not covered by Helmet defaults ─────────────────
+// camera=(self): the page itself may use the camera (in-app QR scanner).
+// Microphone / geolocation stay disabled — the app never needs them.
 app.use((req, res, next) => {
   res.setHeader(
     'Permissions-Policy',
-    'camera=(), microphone=(), geolocation=(), interest-cohort=()'
+    'camera=(self), microphone=(), geolocation=(), interest-cohort=()'
   )
   next()
 })

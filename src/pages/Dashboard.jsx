@@ -28,6 +28,9 @@ import {
   getCachedGroupOrder,
   setCachedGroupOrder,
   applyCachedOrder,
+  getCollapsedMap,
+  setGroupCollapsed,
+  isDatabaseGroupId,
 } from '../lib/groupsStorage.js'
 
 
@@ -45,12 +48,18 @@ export default function Dashboard() {
   const [masked, setMasked] = useState(false)
   const [customGroups, setCustomGroups] = useState([])
   const [editMode, setEditMode] = useState(false)
+  // sectionId -> true when collapsed. Mirrored in localStorage and persisted to
+  // the `collapsed` column on public.groups so it survives every login.
+  const [collapsedGroups, setCollapsedGroups] = useState({})
 
   const searchInputRef = useRef()
 
   // Sync custom groups from storage
   useEffect(() => {
     setCustomGroups(getCustomGroups())
+    // Seed the collapse state from the local mirror so the first paint already
+    // shows the right layout; the database overwrites it once groups load.
+    setCollapsedGroups(getCollapsedMap())
     const unsubscribe = subscribeGroups(() => {
       setCustomGroups(getCustomGroups())
     })
@@ -114,6 +123,11 @@ export default function Dashboard() {
           setCustomGroups(ordered)
         }
       }
+
+      // Read the collapse map *after* syncing so the values the database sent
+      // win over the local cache. If the group fetch failed we still restore
+      // whatever the local cache holds.
+      setCollapsedGroups(getCollapsedMap())
 
       const res = accResult.value
       const meta = getAllAccountMeta()
@@ -496,6 +510,29 @@ export default function Dashboard() {
     })
   }, [])
 
+  // ── Collapse / expand a group accordion ────────────────────────────────────
+  // Writes the local mirror first so the UI reacts instantly, then pushes the
+  // new value to the database so the state is restored on the next login.
+  const handleGroupCollapseChange = useCallback((group, collapsed) => {
+    if (!group || !group.id) return
+    const next = Boolean(collapsed)
+    setGroupCollapsed(group.id, next)
+    setCollapsedGroups((prev) =>
+      prev[group.id] === next ? prev : { ...prev, [group.id]: next }
+    )
+    // Synthetic sections ("Ungrouped", auto-derived issuer groups) have no row
+    // in public.groups, so there is nothing to write server-side.
+    if (!isDatabaseGroupId(group.id)) return
+    api
+      .setGroupCollapsed(group.id, next)
+      .catch((err) =>
+        console.warn(
+          '[Dashboard] Failed to persist group collapse state',
+          err?.message
+        )
+      )
+  }, [])
+
   // Memoized map from id → group index in `customGroups`, used to enable/disable
   // the up/down arrows on each group header.
   const groupIndexById = useMemo(() => {
@@ -714,6 +751,8 @@ export default function Dashboard() {
                   tickerRemaining={tickerRemaining}
                   masked={masked}
                   editMode={editMode}
+                  collapsed={collapsedGroups[section.id] === true}
+                  onCollapseChange={handleGroupCollapseChange}
                   onDeleteAccount={handleAccountDeleted}
                   onUpdateAccount={handleAccountUpdated}
                   onRenameGroup={handleRenameGroup}

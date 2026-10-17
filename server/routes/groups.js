@@ -122,7 +122,7 @@ router.patch('/reorder', async (req, res) => {
   }
 })
 
-// PUT /api/groups/:id — rename or update a custom group
+// PUT /api/groups/:id — rename, re-logo, or persist the collapsed state of a group
 router.put('/:id', async (req, res) => {
   const vaultKey = getVaultKeyFromReq(req)
   const userId = getUserIdFromReq(req)
@@ -133,7 +133,7 @@ router.put('/:id', async (req, res) => {
   if (!sanitizeGroupId(id)) {
     return res.status(400).json({ error: 'Invalid group id' })
   }
-  const { name, logo } = req.body || {}
+  const { name, logo, collapsed } = req.body || {}
   const updates = {}
   if (name !== undefined) {
     const trimmed = sanitizeGroupName(name).slice(0, 64)
@@ -141,6 +141,17 @@ router.put('/:id', async (req, res) => {
     updates.name = trimmed
   }
   if (logo !== undefined) updates.logo = sanitizeLogo(logo)
+  // Accepts only a real boolean — anything else (string "true", 1, null) is
+  // rejected so a malformed client can't silently flip the accordion state.
+  if (collapsed !== undefined) {
+    if (typeof collapsed !== 'boolean') {
+      return res.status(400).json({ error: 'collapsed must be a boolean' })
+    }
+    updates.collapsed = collapsed
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No valid fields to update' })
+  }
   try {
     const updated = await updateGroup(userId, id, updates)
     return res.status(200).json({ group: updated })

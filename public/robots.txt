@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+# Keep encrypted API endpoints out of search indexes
+Disallow: /api/
