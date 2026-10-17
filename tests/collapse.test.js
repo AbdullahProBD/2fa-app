@@ -1,35 +1,14 @@
 import { test, describe, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
-
-// ── localStorage stub ───────────────────────────────────────────────────────
-// Node has no DOM, so we provide the tiny surface groupsStorage.js touches.
-// `fetch` is stubbed too so the fire-and-forget API writes never hit the wire.
-function installLocalStorage() {
-  const store = new Map()
-  globalThis.localStorage = {
-    getItem: (k) => (store.has(k) ? store.get(k) : null),
-    setItem: (k, v) => store.set(k, String(v)),
-    removeItem: (k) => store.delete(k),
-    clear: () => store.clear(),
-    key: (i) => Array.from(store.keys())[i] ?? null,
-    get length() {
-      return store.size
-    },
-  }
-  return store
-}
-
-const fetchCalls = []
-globalThis.fetch = async (path, options = {}) => {
-  fetchCalls.push({ path, body: options.body })
-  return {
-    ok: true,
-    status: 200,
-    json: async () => ({ ok: true }),
-  }
-}
+import {
+  installLocalStorage,
+  installFetch,
+  getFetchCalls,
+  withSilencedConsole,
+} from './helpers/dom.js'
 
 const store = installLocalStorage()
+installFetch()
 
 const {
   getCollapsedMap,
@@ -61,7 +40,7 @@ describe('isDatabaseGroupId', () => {
 describe('group collapse cache', () => {
   beforeEach(() => {
     store.clear()
-    fetchCalls.length = 0
+    getFetchCalls().length = 0
   })
 
   test('starts empty', () => {
@@ -92,11 +71,13 @@ describe('group collapse cache', () => {
     assert.deepEqual(getCollapsedMap(), {})
   })
 
-  test('survives a corrupt cache', () => {
+  test('survives a corrupt cache', async () => {
     store.set('2fa_vault_group_collapsed', '{not json')
-    assert.deepEqual(getCollapsedMap(), {})
-    setGroupCollapsed('grp_a', true)
-    assert.equal(isGroupCollapsed('grp_a'), true)
+    await withSilencedConsole(() => {
+      assert.deepEqual(getCollapsedMap(), {})
+      setGroupCollapsed('grp_a', true)
+      assert.equal(isGroupCollapsed('grp_a'), true)
+    })
   })
 
   test('ignores a non-object cache value', () => {
@@ -108,7 +89,7 @@ describe('group collapse cache', () => {
 describe('syncGroupsFromBackend (collapse state)', () => {
   beforeEach(() => {
     store.clear()
-    fetchCalls.length = 0
+    getFetchCalls().length = 0
   })
 
   test('database values win over the local cache', () => {
@@ -133,7 +114,7 @@ describe('syncGroupsFromBackend (collapse state)', () => {
 
   test('does not persist collapse state itself', () => {
     syncGroupsFromBackend([{ id: 'grp_a', name: 'Global', collapsed: true }])
-    assert.equal(fetchCalls.length, 0)
+    assert.equal(getFetchCalls().length, 0)
   })
 
   test('preserves collapse entries for synthetic sections', () => {
@@ -146,7 +127,7 @@ describe('syncGroupsFromBackend (collapse state)', () => {
 describe('deleteCustomGroup', () => {
   beforeEach(() => {
     store.clear()
-    fetchCalls.length = 0
+    getFetchCalls().length = 0
   })
 
   test('drops the remembered collapse state', async () => {

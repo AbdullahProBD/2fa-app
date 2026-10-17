@@ -376,22 +376,33 @@ export default function Dashboard() {
   // ── Group Actions ─────────────────────────────────────────────────────────
   function handleRenameGroup(groupId, newName, newLogo) {
     try {
-      const old = customGroups.find((g) => g.id === groupId)?.name
-      renameCustomGroup(groupId, newName)
-      // Update accounts in state and sync with backend
+      const target = customGroups.find((g) => g.id === groupId)
+      const oldName = target?.name
+      const nameChanged = oldName !== undefined && oldName !== newName
+      const logoChanged =
+        typeof newLogo === 'string' && newLogo !== (target?.logo || '')
+
+      // Persists the name and the icon to localStorage + the database.
+      renameCustomGroup(groupId, newName, newLogo)
+
+      if (!nameChanged && !logoChanged) return
+
+      // Push the change onto every account in the group so their rows pick up
+      // the new name/icon too. Only the fields that actually moved are sent.
       setAccounts((prev) =>
         prev.map((a) => {
-          if (a.group === old) {
-            const updates = { group_name: newName }
-            if (typeof newLogo === 'string') updates.logo = newLogo
-            api.updateAccount(a.id, updates).catch((err) =>
-              console.error('Failed to sync renamed group on server', err)
-            )
-            const next = { ...a, group: newName }
-            if (typeof newLogo === 'string') next.logo = newLogo
-            return next
-          }
-          return a
+          if (a.group !== oldName && a.group !== newName) return a
+          const updates = {}
+          if (nameChanged) updates.group_name = newName
+          if (logoChanged) updates.logo = newLogo
+          if (Object.keys(updates).length === 0) return a
+          api.updateAccount(a.id, updates).catch((err) =>
+            console.error('Failed to sync renamed group on server', err)
+          )
+          const next = { ...a }
+          if (nameChanged) next.group = newName
+          if (logoChanged) next.logo = newLogo
+          return next
         })
       )
     } catch (e) {

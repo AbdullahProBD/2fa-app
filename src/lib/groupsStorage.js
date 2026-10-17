@@ -94,7 +94,10 @@ export function createCustomGroup(name, logo = '') {
   return newGroup
 }
 
-export function renameCustomGroup(groupId, newName) {
+// `newLogo` distinguishes "leave the icon alone" (undefined/null) from
+// "the user explicitly cleared it" (an empty string), so a plain rename does
+// not wipe the icon and an icon-only change does not rename anything.
+export function renameCustomGroup(groupId, newName, newLogo = null) {
   const trimmed = (newName || '').trim()
   if (!trimmed) throw new Error('Group name cannot be empty')
   const groups = getCustomGroups()
@@ -107,7 +110,12 @@ export function renameCustomGroup(groupId, newName) {
   if (duplicate) throw new Error(`Group "${trimmed}" already exists`)
 
   const oldName = target.name
-  const updated = groups.map((g) => (g.id === groupId ? { ...g, name: trimmed } : g))
+  const wantsLogo = typeof newLogo === 'string'
+  const updated = groups.map((g) =>
+    g.id === groupId
+      ? { ...g, name: trimmed, ...(wantsLogo ? { logo: newLogo } : {}) }
+      : g
+  )
   saveCustomGroups(updated)
 
   // Also update account metadata mapped to this old group name
@@ -127,10 +135,14 @@ export function renameCustomGroup(groupId, newName) {
     console.error('Failed to update account meta on group rename', e)
   }
 
-  // Persist rename to database in background
-  api.updateGroup(groupId, { name: trimmed }).catch((err) => {
-    console.warn('[groupsStorage] Failed to rename group in DB:', err?.message)
-  })
+  // Persist rename (and any icon change) to the database in background.
+  // The logo must go to public.groups too — otherwise the next
+  // syncGroupsFromBackend() overlays the stale DB value and the icon reverts.
+  api
+    .updateGroup(groupId, wantsLogo ? { name: trimmed, logo: newLogo } : { name: trimmed })
+    .catch((err) => {
+      console.warn('[groupsStorage] Failed to rename group in DB:', err?.message)
+    })
 
   notify()
   return trimmed
