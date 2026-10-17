@@ -54,7 +54,11 @@ app.use(
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", 'https://va.vercel-scripts.com'], // Vercel Analytics / Speed Insights
         styleSrc: ["'self'", "'unsafe-inline'"], // needed for Vite's injected styles
-        imgSrc: ["'self'", 'data:', 'https:'],
+        // 'blob:' is required by the QR uploader, which hands a picked File to
+        // <img> via URL.createObjectURL. CSP matches on the URL *scheme*, so
+        // 'self' does not cover blob: — without it every QR image upload fails
+        // with "Failed to load image for scanning".
+        imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
         connectSrc: ["'self'", 'https://*.supabase.co', 'https://*.vercel-insights.com', 'https://*.vercel-analytics.com', 'https://va.vercel-scripts.com'],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],

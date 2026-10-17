@@ -198,7 +198,19 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       }
       img.onerror = () => {
         URL.revokeObjectURL(url)
-        reject(new Error('Failed to load image for scanning'))
+        // Some formats pass the `image/*` MIME check but cannot actually be
+        // decoded by the browser (HEIC/HEIF from iPhones, some AVIF/JXL).
+        // Say so instead of the opaque "failed to load".
+        const type = String(file?.type || '').toLowerCase()
+        if (type.includes('heic') || type.includes('heif')) {
+          reject(new Error(
+            'Your browser cannot read HEIC/HEIF images. Re-save or screenshot it as a PNG or JPEG and try again.'
+          ))
+          return
+        }
+        reject(new Error(
+          'Could not read that image. Please use a PNG, JPEG, or WebP file.'
+        ))
       }
       img.src = url
     })
@@ -227,7 +239,9 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
     const img = await loadImageElement(file)
     const W = img.naturalWidth || img.width
     const H = img.naturalHeight || img.height
-    if (!W || !H) throw new Error('Failed to load image for scanning')
+    if (!W || !H) {
+      throw new Error('Could not read that image. Please use a PNG, JPEG, or WebP file.')
+    }
 
     const fit = (maxDim) => {
       const scale = Math.min(1, maxDim / Math.max(W, H))
@@ -313,7 +327,10 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
           const res = await api.parseQr(dataUri)
           qrContent = res.data
         } catch (e) {
-          throw clientErr || e
+          // Prefer the server's message when it has one — it runs a different
+          // decoder, so its failure is usually the more specific explanation.
+          // `clientErr || e` always resolved to clientErr and discarded this.
+          throw (e && e.message) ? e : clientErr
         }
       }
 
@@ -327,6 +344,9 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       setErr(e.message || 'Could not scan QR code. Please try pasting the URI or manual entry.')
     } finally {
       setLoading(false)
+      // Clear the input so picking the same file again re-triggers onChange
+      // instead of silently doing nothing.
+      if (fileRef.current) fileRef.current.value = ''
     }
   }
 
