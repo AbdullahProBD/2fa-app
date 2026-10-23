@@ -11,8 +11,19 @@ const originalVercel = process.env.VERCEL
 process.env.SESSION_SECRET = 'a'.repeat(64)
 process.env.NODE_ENV = 'production'
 
-const { requireSession, buildCsrfCookie, buildCookie, buildClearCookie } =
-  await import('../server/lib/auth.js')
+const {
+  requireSession,
+  requireCsrfIfSession,
+  buildCsrfCookie,
+  buildCookie,
+  buildClearCookie,
+  createSession,
+  verifySession,
+  csrfTokenForSession,
+  readCookieFromReq,
+  unwrapVaultKeyFromSession,
+} = await import('../server/lib/auth.js')
+import jwt from 'jsonwebtoken'
 
 function makeRes() {
   const res = {
@@ -69,19 +80,117 @@ describe('requireSession middleware', () => {
     assert.equal(called, true)
   })
 
-  test('allows POST with valid session AND matching CSRF', async () => {
-    const { signSession } = await import('../server/lib/auth.js')
-    const token = signSession({ userId: 'test-uid', vaultKey: Buffer.alloc(32) })
-    const csrf = buildCsrfCookie()
+  test('allows POST with valid session AND matching session-bound CSRF', () => {
+    const { token, csrfToken } = createSession({ userId: 'test-uid', vaultKey: Buffer.alloc(32) })
     let called = false
     const req = makeReq({
       method: 'POST',
-      cookies: `2fa_session=${token}; 2fa_csrf=${csrf.token}`,
-      headers: { 'x-csrf-token': csrf.token },
+      cookies: `2fa_session=${token}; 2fa_csrf=${csrfToken}`,
+      headers: { 'x-csrf-token': csrfToken },
     })
     const res = makeRes()
     requireSession(req, res, () => { called = true })
     assert.equal(called, true)
+  })
+
+  test('rejects POST when attacker sets both CSRF cookie and header to a self-chosen value', () => {
+    // Cookie-injection scenario: the double-submit pair matches, but the value
+    // is not the one derived from the victim's session.
+    const { token } = createSession({ userId: 'test-uid', vaultKey: Buffer.alloc(32) })
+    const forged = buildCsrfCookie().token
+    let called = false
+    const req = makeReq({
+      method: 'POST',
+      cookies: `2fa_session=${token}; 2fa_csrf=${forged}`,
+      headers: { 'x-csrf-token': forged },
+    })
+    const res = makeRes()
+    requireSession(req, res, () => { called = true })
+    assert.equal(called, false)
+    assert.equal(res.statusCode, 403)
+  })
+
+  test('rejects a CSRF token taken from a different session', () => {
+    const a = createSession({ userId: 'test-uid', vaultKey: Buffer.alloc(32) })
+    const b = createSession({ userId: 'test-uid', vaultKey: Buffer.alloc(32) })
+    assert.notEqual(a.csrfToken, b.csrfToken)
+    const req = makeReq({
+      method: 'DELETE',
+      cookies: `2fa_session=${a.token}; 2fa_csrf=${b.csrfToken}`,
+      headers: { 'x-csrf-token': b.csrfToken },
+    })
+    const res = makeRes()
+    let called = false
+    requireSession(req, res, () => { called = true })
+    assert.equal(called, false)
+    assert.equal(res.statusCode, 403)
+  })
+
+  test('csrfTokenForSession is stable for a session (so /api/csrf can re-issue it)', () => {
+    const { token, csrfToken } = createSession({ userId: 'u', vaultKey: Buffer.alloc(32) })
+    assert.equal(csrfTokenForSession(verifySession(token)), csrfToken)
+  })
+})
+
+describe('session token verification', () => {
+  test('rejects tokens signed with a different algorithm (alg=none)', () => {
+    const none = jwt.sign({ uid: 'u', sid: 's' }, '', { algorithm: 'none' })
+    assert.equal(verifySession(none), null)
+  })
+
+  test('rejects tokens without a sid claim (pre-CSRF-binding sessions)', () => {
+    const legacy = jwt.sign({ uid: 'u' }, process.env.SESSION_SECRET, { algorithm: 'HS256' })
+    assert.equal(verifySession(legacy), null)
+  })
+
+  test('rejects expired tokens', () => {
+    const expired = jwt.sign({ uid: 'u', sid: 's' }, process.env.SESSION_SECRET, {
+      algorithm: 'HS256',
+      expiresIn: -10,
+    })
+    assert.equal(verifySession(expired), null)
+  })
+
+  test('wrapped vault key round-trips and rejects truncated GCM tags', () => {
+    const vaultKey = Buffer.alloc(32, 7)
+    const { token } = createSession({ userId: 'u', vaultKey })
+    const claims = verifySession(token)
+    assert.equal(Buffer.compare(unwrapVaultKeyFromSession(claims.vk), vaultKey), 0)
+    const shortTag = { ...claims.vk, t: Buffer.from(claims.vk.t, 'base64').subarray(0, 4).toString('base64') }
+    assert.equal(unwrapVaultKeyFromSession(shortTag), null)
+  })
+})
+
+describe('requireCsrfIfSession (logout)', () => {
+  test('lets a request with no session through so stale cookies can be cleared', () => {
+    let called = false
+    requireCsrfIfSession(makeReq({ method: 'POST' }), makeRes(), () => { called = true })
+    assert.equal(called, true)
+  })
+
+  test('still enforces CSRF when a valid session is present', () => {
+    const { token } = createSession({ userId: 'u', vaultKey: Buffer.alloc(32) })
+    const res = makeRes()
+    let called = false
+    requireCsrfIfSession(makeReq({ method: 'POST', cookies: `2fa_session=${token}` }), res, () => { called = true })
+    assert.equal(called, false)
+    assert.equal(res.statusCode, 403)
+  })
+})
+
+describe('cookie parsing', () => {
+  test('finds a cookie among others and keeps "=" inside the value', () => {
+    const req = makeReq({ cookies: 'a=1; 2fa_session=abc=def ; b=2' })
+    assert.equal(readCookieFromReq(req, '2fa_session'), 'abc=def')
+  })
+
+  test('does not match cookies whose name merely ends with the target', () => {
+    const req = makeReq({ cookies: 'x2fa_session=evil' })
+    assert.equal(readCookieFromReq(req, '2fa_session'), null)
+  })
+
+  test('treats an empty value as absent', () => {
+    assert.equal(readCookieFromReq(makeReq({ cookies: '2fa_session=' }), '2fa_session'), null)
   })
 })
 

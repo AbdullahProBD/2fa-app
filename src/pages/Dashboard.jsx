@@ -31,7 +31,18 @@ import {
   getCollapsedMap,
   setGroupCollapsed,
   isDatabaseGroupId,
+  saveCustomGroups,
+  swapWithinGroup,
+  clearVaultCache,
 } from '../lib/groupsStorage.js'
+
+const CODE_RETRY_BASE_MS = 3000
+const CODE_RETRY_MAX_MS = 60000
+
+// Epoch window index of `period`-second TOTP codes at (server-aligned) time `ms`.
+function windowOf(ms, period) {
+  return Math.floor(ms / (period * 1000))
+}
 
 
 export default function Dashboard() {
@@ -54,6 +65,29 @@ export default function Dashboard() {
 
   const searchInputRef = useRef()
 
+  // Latest values for handlers/timers that must not close over stale state.
+  const accountsRef = useRef([])
+  accountsRef.current = accounts
+  const customGroupsRef = useRef([])
+  customGroupsRef.current = customGroups
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // Code bookkeeping (refs: updated from timers/responses, never rendered).
+  const clockOffsetsRef = useRef({}) // period -> (server - local) ms
+  const codeWindowRef = useRef({}) // account id -> window index of the held code
+  const codeAttemptRef = useRef({}) // account id -> { at, fails } for refresh backoff
+  const fetchSeqRef = useRef(0)
+  const batchInFlightRef = useRef(0)
+  const loadSeqRef = useRef(0)
+  // Serialises reorder writes so the last one the user made is the last applied.
+  const orderChainRef = useRef({ accounts: Promise.resolve(), groups: Promise.resolve() })
+
   // Sync custom groups from storage
   useEffect(() => {
     setCustomGroups(getCustomGroups())
@@ -66,42 +100,91 @@ export default function Dashboard() {
     return unsubscribe
   }, [])
 
-  // ── Fetch codes for all accounts ──────────────────────────────────────────
-  const fetchAllCodes = useCallback(async (accountList) => {
-    if (!accountList || accountList.length === 0) return
-    try {
-      // 1. Attempt batch code fetch
-      const res = await api.getAllCodes()
-      if (res && res.codes) {
-        setCodes(res.codes)
-        return
-      }
-    } catch (e) {
-      // 2. Fallback: fetch individually in parallel
-      try {
-        const results = await Promise.allSettled(
-          accountList.map((a) => api.getCode(a.id))
-        )
-        const batch = {}
-        results.forEach((r, idx) => {
-          if (r.status === 'fulfilled') {
-            batch[accountList[idx].id] = r.value
-          }
-        })
-        setCodes(batch)
-      } catch (err) {
-        console.error('Failed to fetch TOTP codes', err)
-      }
-    }
+  // ── Code ingestion ────────────────────────────────────────────────────────
+  // Derive the server clock offset from the `remaining` it reports, sampled at
+  // the middle of the request so network latency doesn't skew it. Offsets of
+  // ±1s are quantisation noise and ignored.
+  const learnClockOffset = useCallback((period, remaining, sampledAt) => {
+    if (!period || typeof remaining !== 'number') return
+    const localSec = Math.floor(sampledAt / 1000)
+    const localRem = period - (localSec % period)
+    let d = (((localRem - remaining) % period) + period) % period
+    if (d > period / 2) d -= period
+    clockOffsetsRef.current[period] = Math.abs(d) <= 1 ? 0 : d * 1000
   }, [])
+
+  const applyCode = useCallback(
+    (id, res, sampledAt) => {
+      if (!res || typeof res.code !== 'string') return
+      const period = res.period || 30
+      if (typeof res.remaining === 'number') {
+        learnClockOffset(period, res.remaining, sampledAt)
+        // Derive the window from the server's own `remaining` (its window ends
+        // `remaining` seconds from now), so sub-second clock noise can never
+        // label a code from the previous window as the current one.
+        const endMs =
+          sampledAt + (res.remaining - 0.5) * 1000 + (clockOffsetsRef.current[period] || 0)
+        const w = Math.round(endMs / (period * 1000)) - 1
+        // A slower, older response must never replace a newer code.
+        if (codeWindowRef.current[id] !== undefined && codeWindowRef.current[id] > w) return
+        codeWindowRef.current[id] = w
+      } else {
+        codeWindowRef.current[id] = Infinity // HOTP: not time-based
+      }
+      delete codeAttemptRef.current[id]
+      setCodes((prev) => ({ ...prev, [id]: res }))
+    },
+    [learnClockOffset]
+  )
+
+  // ── Fetch codes for all accounts ──────────────────────────────────────────
+  const fetchAllCodes = useCallback(
+    async (accountList) => {
+      if (!accountList || accountList.length === 0) return
+      const seq = ++fetchSeqRef.current
+      const startedAt = Date.now()
+      batchInFlightRef.current++
+      try {
+        try {
+          // 1. Attempt batch code fetch
+          const res = await api.getAllCodes()
+          if (!mountedRef.current || seq !== fetchSeqRef.current) return
+          const sampledAt = (startedAt + Date.now()) / 2
+          if (res && res.codes) {
+            Object.entries(res.codes).forEach(([id, c]) => applyCode(id, c, sampledAt))
+            return
+          }
+        } catch (e) {
+          if (e && e.status === 401) return // the unauthorized handler takes over
+        }
+        // 2. Fallback: fetch individually in parallel
+        const results = await Promise.allSettled(
+          accountList.map(async (a) => {
+            const t0 = Date.now()
+            const r = await api.getCode(a.id)
+            return { id: a.id, r, at: (t0 + Date.now()) / 2 }
+          })
+        )
+        if (!mountedRef.current || seq !== fetchSeqRef.current) return
+        results.forEach((r) => {
+          if (r.status === 'fulfilled') applyCode(r.value.id, r.value.r, r.value.at)
+        })
+      } finally {
+        batchInFlightRef.current--
+      }
+    },
+    [applyCode]
+  )
 
   // ── Load accounts & groups from database ───────────────────────────────────
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current
     try {
       const [accResult, grpResult] = await Promise.allSettled([
         api.listAccounts(),
         api.listGroups(),
       ])
+      if (!mountedRef.current || seq !== loadSeqRef.current) return
 
       if (accResult.status === 'rejected') {
         throw accResult.reason
@@ -109,7 +192,7 @@ export default function Dashboard() {
 
       // Sync backend groups into local storage, then apply the cached order
       if (grpResult.status === 'fulfilled' && grpResult.value?.groups) {
-        syncGroupsFromBackend(grpResult.value.groups)
+        syncGroupsFromBackend(grpResult.value.groups, { authoritative: true })
         const cachedGrpOrder = getCachedGroupOrder()
         if (cachedGrpOrder.length > 0) {
           const local = getCustomGroups()
@@ -132,24 +215,24 @@ export default function Dashboard() {
       const res = accResult.value
       const meta = getAllAccountMeta()
 
-      // Merge backend accounts with local group/logo metadata
+      // The server is the source of truth for group/logo. The local mirror is
+      // only a fallback for a response that omits the field entirely, so a
+      // change made on another device (or a deleted group) is never shadowed.
       const merged = (res.accounts || []).map((acc) => {
         const local = meta[acc.id]
         let groupVal = ''
-        if (local && typeof local.group === 'string' && local.group.trim()) {
-          groupVal = local.group.trim()
-        } else if (acc.group && typeof acc.group === 'string') {
+        if (typeof acc.group === 'string') {
           const g = acc.group.trim()
-          if (g.toLowerCase() !== 'general') {
-            groupVal = g
-          }
+          if (g.toLowerCase() !== 'general') groupVal = g
+        } else if (local && typeof local.group === 'string') {
+          groupVal = local.group.trim()
         }
 
         let logoVal = ''
-        if (local && typeof local.logo === 'string' && local.logo) {
-          logoVal = local.logo
-        } else if (acc.logo) {
+        if (typeof acc.logo === 'string') {
           logoVal = acc.logo
+        } else if (local && typeof local.logo === 'string') {
+          logoVal = local.logo
         }
 
         return {
@@ -179,16 +262,14 @@ export default function Dashboard() {
         }
       })
 
+      setErr('')
       setAccounts(orderedMerged)
       fetchAllCodes(orderedMerged)
     } catch (e) {
-      if (e.status === 401) {
-        window.location.reload()
-      } else {
-        setErr(e.message)
-      }
+      // A 401 is handled globally (back to the login screen).
+      if (!e || e.status !== 401) setErr((e && e.message) || 'Failed to load your vault')
     } finally {
-      setLoading(false)
+      if (mountedRef.current && seq === loadSeqRef.current) setLoading(false)
     }
   }, [fetchAllCodes])
 
@@ -196,46 +277,61 @@ export default function Dashboard() {
     load()
   }, [load])
 
-  // ── Precision Epoch-Synchronized Countdown Timer ──────────────────────────
+  // ── Server-clock-aligned countdown + code rollover ────────────────────────
   useEffect(() => {
-    if (accounts.length === 0) return
+    if (accounts.length === 0) return undefined
     const refreshing = new Set()
 
+    function refreshOne(id) {
+      refreshing.add(id)
+      const prev = codeAttemptRef.current[id] || { at: 0, fails: 0 }
+      codeAttemptRef.current[id] = { at: Date.now(), fails: prev.fails }
+      const t0 = Date.now()
+      api
+        .getCode(id)
+        .then((res) => {
+          if (mountedRef.current) applyCode(id, res, (t0 + Date.now()) / 2)
+        })
+        .catch((e) => {
+          const cur = codeAttemptRef.current[id] || { at: Date.now(), fails: 0 }
+          codeAttemptRef.current[id] = { at: Date.now(), fails: cur.fails + 1 }
+          console.error('Failed to refresh code', e?.message)
+        })
+        .finally(() => refreshing.delete(id))
+    }
+
     function tick() {
-      const nowSec = Math.floor(Date.now() / 1000)
+      const now = Date.now()
       const newRemaining = {}
-      const needRefresh = []
 
       accounts.forEach((acc) => {
         if (acc.type === 'hotp') return
         const period = acc.period || 30
-        const rem = period - (nowSec % period)
-        newRemaining[acc.id] = rem
+        const serverNow = now + (clockOffsetsRef.current[period] || 0)
+        newRemaining[acc.id] = period - (Math.floor(serverNow / 1000) % period)
 
-        // If code just rolled over (remaining === period), refresh code
-        if (rem === period && !refreshing.has(acc.id)) {
-          needRefresh.push(acc.id)
-          refreshing.add(acc.id)
+        // Refresh when the held code belongs to an earlier window (rollover,
+        // sleep/resume, missed tick) or was never fetched. Failures back off.
+        const held = codeWindowRef.current[acc.id]
+        if (held !== undefined && held >= windowOf(serverNow, period)) return
+        // The initial batch is still in flight; don't duplicate it per account.
+        if (held === undefined && batchInFlightRef.current > 0) return
+        if (refreshing.has(acc.id)) return
+        const attempt = codeAttemptRef.current[acc.id]
+        if (attempt) {
+          const wait = Math.min(CODE_RETRY_MAX_MS, CODE_RETRY_BASE_MS * 2 ** attempt.fails)
+          if (now - attempt.at < wait) return
         }
+        refreshOne(acc.id)
       })
 
       setTickerRemaining(newRemaining)
-
-      // Refresh any expired accounts (de-duplicated and guarded against races)
-      needRefresh.forEach((id) => {
-        api.getCode(id)
-          .then((res) => {
-            setCodes((prev) => ({ ...prev, [id]: res }))
-          })
-          .catch((e) => console.error('Failed to refresh code', e))
-          .finally(() => refreshing.delete(id))
-      })
     }
 
     tick()
     const timer = setInterval(tick, 1000)
 
-    // Handle tab focus / wake up
+    // Timers are throttled while hidden: resync immediately on return.
     function onVisibilityChange() {
       if (document.visibilityState === 'visible') {
         tick()
@@ -248,15 +344,25 @@ export default function Dashboard() {
       clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [accounts, fetchAllCodes])
+  }, [accounts, fetchAllCodes, applyCode])
 
   // ── Keyboard shortcut: "/" to focus search ────────────────────────────────
   useEffect(() => {
     function handleKeyDown(e) {
+      const el = document.activeElement
+      const typing =
+        el &&
+        (el.tagName === 'INPUT' ||
+          el.tagName === 'TEXTAREA' ||
+          el.tagName === 'SELECT' ||
+          el.isContentEditable)
       if (
         e.key === '/' &&
-        document.activeElement?.tagName !== 'INPUT' &&
-        document.activeElement?.tagName !== 'TEXTAREA'
+        !typing &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !document.querySelector('[role="dialog"]')
       ) {
         e.preventDefault()
         searchInputRef.current?.focus()
@@ -265,6 +371,16 @@ export default function Dashboard() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
+
+  // A selected group that was renamed or deleted would leave an empty view.
+  useEffect(() => {
+    if (activeGroupFilter === 'ALL' || activeGroupFilter === 'UNGROUPED') return
+    const key = activeGroupFilter.toLowerCase()
+    const exists =
+      customGroups.some((g) => g.name.toLowerCase() === key) ||
+      accounts.some((a) => (a.group || '').toLowerCase() === key)
+    if (!exists) setActiveGroupFilter('ALL')
+  }, [activeGroupFilter, customGroups, accounts])
 
   // ── Filtering & Grouping Logic ────────────────────────────────────────────
   const filteredAccounts = useMemo(() => {
@@ -374,68 +490,72 @@ export default function Dashboard() {
   }, [accounts])
 
   // ── Group Actions ─────────────────────────────────────────────────────────
+  // Throws on validation errors (duplicate name, ...) so the GroupModal can show
+  // them inline instead of closing on a failed save.
   function handleRenameGroup(groupId, newName, newLogo) {
-    try {
-      const target = customGroups.find((g) => g.id === groupId)
-      const oldName = target?.name
-      const oldLogo = target?.logo || ''
-      const nameChanged = oldName !== undefined && oldName !== newName
-      const logoChanged = typeof newLogo === 'string' && newLogo !== oldLogo
+    const target = customGroups.find((g) => g.id === groupId)
+    const oldName = target?.name
+    const oldLogo = target?.logo || ''
 
-      // Persists the name AND the icon to localStorage + the database. The icon
-      // belongs to the group alone — accounts keep their own logo and fall back
-      // to issuer auto-detection.
-      renameCustomGroup(groupId, newName, newLogo)
+    // Persists the name AND the icon to localStorage + the database. The icon
+    // belongs to the group alone — accounts keep their own logo and fall back
+    // to issuer auto-detection.
+    const finalName = renameCustomGroup(groupId, newName, newLogo)
+    const nameChanged = oldName !== undefined && oldName !== finalName
+    const logoChanged = typeof newLogo === 'string' && newLogo !== oldLogo
+    if (oldName === undefined) return
 
-      // Only the name is propagated to member accounts. `logo` is deliberately
-      // NOT sent: a group's icon must not overwrite each account's own icon.
-      if (nameChanged) {
-        setAccounts((prev) =>
-          prev.map((a) => {
-            if (a.group !== oldName && a.group !== newName) return a
-            api.updateAccount(a.id, { group_name: newName }).catch((err) =>
-              console.error('Failed to sync renamed group on server', err)
-            )
-            return { ...a, group: newName }
-          })
+    const sameGroup = (a) => (a.group || '').toLowerCase() === oldName.toLowerCase()
+    // Only the name is propagated to member accounts. `logo` is deliberately
+    // NOT sent: a group's icon must not overwrite each account's own icon.
+    // Side effects run here, outside any state updater (StrictMode runs
+    // updaters twice).
+    const members = accountsRef.current.filter(sameGroup)
+    if (nameChanged) {
+      members.forEach((a) => {
+        api.updateAccount(a.id, { group_name: finalName }).catch((err) =>
+          console.error('Failed to sync renamed group on server', err)
         )
-      }
-
-      // Undo the damage from an earlier build that stamped the group's icon onto
-      // every member account: clear it only where it exactly matches the icon
-      // the group used to have, so those rows fall back to issuer detection.
-      // Accounts carrying their own icon are left untouched.
-      if (logoChanged && oldLogo) {
-        setAccounts((prev) =>
-          prev.map((a) => {
-            if (a.group !== (nameChanged ? newName : oldName)) return a
-            if (a.logo !== oldLogo) return a
-            api.updateAccount(a.id, { logo: '' }).catch((err) =>
-              console.error('Failed to clear group icon from account', err)
-            )
-            return { ...a, logo: '' }
-          })
+      })
+    }
+    // Undo the damage from an earlier build that stamped the group's icon onto
+    // every member account: clear it only where it exactly matches the icon
+    // the group used to have, so those rows fall back to issuer detection.
+    const clearIconIds = new Set()
+    if (logoChanged && oldLogo) {
+      members.forEach((a) => {
+        if (a.logo !== oldLogo) return
+        clearIconIds.add(a.id)
+        api.updateAccount(a.id, { logo: '' }).catch((err) =>
+          console.error('Failed to clear group icon from account', err)
         )
-      }
-    } catch (e) {
-      alert(e.message)
+      })
+    }
+    if (nameChanged || clearIconIds.size > 0) {
+      setAccounts((prev) =>
+        prev.map((a) => {
+          if (!sameGroup(a)) return a
+          return {
+            ...a,
+            ...(nameChanged ? { group: finalName } : {}),
+            ...(clearIconIds.has(a.id) ? { logo: '' } : {}),
+          }
+        })
+      )
     }
   }
 
   function handleDeleteGroup(groupId) {
     const old = customGroups.find((g) => g.id === groupId)?.name
     deleteCustomGroup(groupId)
-    setAccounts((prev) =>
-      prev.map((a) => {
-        if (a.group === old) {
-          api.updateAccount(a.id, { group_name: '' }).catch((err) =>
-            console.error('Failed to clear group on server', err)
-          )
-          return { ...a, group: '' }
-        }
-        return a
-      })
-    )
+    if (!old) return
+    const sameGroup = (a) => (a.group || '').toLowerCase() === old.toLowerCase()
+    accountsRef.current.filter(sameGroup).forEach((a) => {
+      api.updateAccount(a.id, { group_name: '' }).catch((err) =>
+        console.error('Failed to clear group on server', err)
+      )
+    })
+    setAccounts((prev) => prev.map((a) => (sameGroup(a) ? { ...a, group: '' } : a)))
   }
 
   function handleAddAccountToGroup(groupName) {
@@ -459,79 +579,53 @@ export default function Dashboard() {
   }
 
   // ── Move-account-within-group via up/down arrow buttons ──────────────────
-  // Swaps the source account with the target account. We only need to swap
-  // positions inside the same group's slice; other groups stay untouched.
-  const handleMoveAccount = useCallback((group, target, source) => {
-    if (!group || !target || !source || target.id === source.id) return
-    setAccounts((prev) => {
-      // Build the new ordering for the whole list by rebuilding each group's
-      // sub-list individually.
-      const next = []
-      const groups = new Map()
-      for (const acc of prev) {
-        const k = (acc.group || '').toLowerCase()
-        if (!groups.has(k)) groups.set(k, [])
-        groups.get(k).push(acc)
-      }
-      // Apply the swap inside the relevant group slice.
-      const k = (group.name || '').toLowerCase()
-      const slice = groups.get(k) || []
-      const sIdx = slice.findIndex((a) => a.id === source.id)
-      const tIdx = slice.findIndex((a) => a.id === target.id)
-      if (sIdx !== -1 && tIdx !== -1) {
-        const tmp = slice[sIdx]
-        slice[sIdx] = slice[tIdx]
-        slice[tIdx] = tmp
-      }
-      // Re-assemble in the same outer order as before.
-      for (const acc of prev) {
-        const key = (acc.group || '').toLowerCase()
-        const sliceForKey = groups.get(key)
-        if (sliceForKey && sliceForKey.length > 0) {
-          next.push(sliceForKey.shift())
-        }
-      }
-      // Cache the new global order so a reload shows the same layout
-      setCachedAccountOrder(next.map((a) => a.id))
-      // Send the new order to the server (global — same list as the cache)
-      api
-        .reorderAccounts(next.map((a) => a.id))
-        .catch((err) =>
-          console.warn('[Dashboard] Failed to persist account order', err?.message)
-        )
-      return next
-    })
+  // Swaps the source account with the target account inside the group's slice;
+  // other groups stay untouched. State, cache and server write all happen here
+  // (not inside a state updater, which StrictMode would run twice).
+  const persistOrder = useCallback((kind, ids) => {
+    const send = kind === 'accounts' ? api.reorderAccounts : api.reorderGroups
+    orderChainRef.current[kind] = orderChainRef.current[kind]
+      .then(() => send(ids))
+      .catch((err) =>
+        console.warn(`[Dashboard] Failed to persist ${kind} order`, err?.message)
+      )
   }, [])
+
+  const handleMoveAccount = useCallback(
+    (group, target, source) => {
+      if (!group || !target || !source) return
+      const groupName = group.id === 'ungrouped' ? '' : group.name
+      const next = swapWithinGroup(accountsRef.current, groupName, source.id, target.id)
+      if (!next) return
+      accountsRef.current = next
+      setAccounts(next)
+      const ids = next.map((a) => a.id)
+      setCachedAccountOrder(ids)
+      persistOrder('accounts', ids)
+    },
+    [persistOrder]
+  )
 
   // ── Move-group up/down via the header arrows ──────────────────────────────
   // Swaps the group with its neighbour in `customGroups`, persists locally,
   // and pushes the new global order to the server.
-  const handleMoveGroup = useCallback((group, direction) => {
-    setCustomGroups((prev) => {
+  const handleMoveGroup = useCallback(
+    (group, direction) => {
+      const prev = customGroupsRef.current
       const idx = prev.findIndex((g) => g.id === group.id)
       const targetIdx = idx + direction
-      if (idx === -1 || targetIdx < 0 || targetIdx >= prev.length) return prev
+      if (idx === -1 || targetIdx < 0 || targetIdx >= prev.length) return
       const next = prev.slice()
-      const tmp = next[idx]
-      next[idx] = next[targetIdx]
-      next[targetIdx] = tmp
-      try {
-        localStorage.setItem(
-          '2fa_vault_custom_groups',
-          JSON.stringify(next)
-        )
-      } catch (e) {
-        console.error('Failed to persist reordered groups to localStorage', e)
-      }
-      setCachedGroupOrder(next.map((g) => g.id))
-      api
-        .reorderGroups(next.map((g) => g.id))
-        .catch((err) =>
-          console.warn('[Dashboard] Failed to persist group order', err?.message)
-        )
-      return next
-    })
-  }, [])
+      ;[next[idx], next[targetIdx]] = [next[targetIdx], next[idx]]
+      customGroupsRef.current = next
+      setCustomGroups(next)
+      saveCustomGroups(next)
+      const ids = next.map((g) => g.id)
+      setCachedGroupOrder(ids)
+      persistOrder('groups', ids)
+    },
+    [persistOrder]
+  )
 
   // ── Collapse / expand a group accordion ────────────────────────────────────
   // Writes the local mirror first so the UI reacts instantly, then pushes the
@@ -568,21 +662,23 @@ export default function Dashboard() {
     try {
       await api.logout()
     } catch (e) {
-      console.error(e)
+      console.error('Logout request failed', e?.message)
     }
+    clearVaultCache()
     window.location.reload()
   }
 
   return (
-    <div className="app">
+    <div className="app-shell">
       {/* ── Top Header Bar ────────────────────────────────────────── */}
-      <div className="header">
+      <header className="header">
+        <div className="header-inner">
         <div className="logo">
           <div className="vault-brand-icon">
             <FontAwesomeIcon icon={faShieldHalved} style={{ fontSize: 20 }} />
           </div>
           <h1>2FA Vault</h1>
-          <span className="badge">{accounts.length}</span>
+          <span className="badge" title={`${accounts.length} accounts`}>{accounts.length}</span>
         </div>
 
         <div className="header-actions">
@@ -606,6 +702,7 @@ export default function Dashboard() {
             className="btn header-btn"
             onClick={() => setShowNewGroupModal(true)}
             title="Create a new custom group"
+            aria-label="New group"
           >
             <FontAwesomeIcon icon={faPlus} style={{ fontSize: 12 }} /> <span className="btn-label">Group</span>
           </button>
@@ -615,6 +712,7 @@ export default function Dashboard() {
             className={`btn header-btn ${editMode ? 'btn-primary' : ''}`}
             onClick={() => setEditMode((v) => !v)}
             title={editMode ? 'Done editing positions' : 'Edit positions of groups and accounts'}
+            aria-label={editMode ? 'Done editing' : 'Edit layout'}
             aria-pressed={editMode}
           >
             {editMode ? (
@@ -627,6 +725,8 @@ export default function Dashboard() {
           {/* Add Account Button */}
           <button
             className="btn btn-primary header-btn header-btn-add"
+            title="Add account"
+            aria-label="Add account"
             onClick={() => {
               setAddDefaultGroup(activeGroupFilter !== 'ALL' && activeGroupFilter !== 'UNGROUPED' ? activeGroupFilter : '')
               setShowAdd(true)
@@ -640,9 +740,12 @@ export default function Dashboard() {
             <FontAwesomeIcon icon={faLock} style={{ fontSize: 12 }} /> <span className="btn-label">Lock</span>
           </button>
         </div>
-      </div>
+        </div>
+      </header>
 
-      {/* ── Search Bar matching user mockup ───────────────────────── */}
+      <main className="app">
+      {/* ── Search + group filters ────────────────────────────────── */}
+      <div className="toolbar">
       <div className="search-bar-container">
         <div className="search-icon">
           <FontAwesomeIcon icon={faMagnifyingGlass} style={{ fontSize: 16 }} />
@@ -666,11 +769,12 @@ export default function Dashboard() {
             className="search-clear-btn"
             onClick={() => setSearchQuery('')}
             title="Clear search"
+            aria-label="Clear search"
           >
             <FontAwesomeIcon icon={faXmark} style={{ fontSize: 14 }} />
           </button>
         )}
-        <span className="search-kbd-shortcut">/</span>
+        <span className="search-kbd-shortcut" aria-hidden="true">/</span>
       </div>
 
       {/* ── Custom Groups Filter Pills ────────────────────────────── */}
@@ -715,8 +819,9 @@ export default function Dashboard() {
           <FontAwesomeIcon icon={faPlus} style={{ fontSize: 11 }} /> New Group
         </button>
       </div>
+      </div>
 
-      {err && <div className="error">{err}</div>}
+      {err && <div className="error" role="alert">{err}</div>}
 
       {/* ── Content View ─────────────────────────────────────────── */}
       {loading ? (
@@ -742,9 +847,9 @@ export default function Dashboard() {
             </button>
           </div>
         </div>
-      ) : filteredAccounts.length === 0 ? (
+      ) : filteredAccounts.length === 0 && searchQuery.trim() ? (
         <div className="card empty">
-          No accounts found matching &ldquo;{searchQuery}&rdquo;.
+          No accounts found matching &ldquo;{searchQuery.trim()}&rdquo;.
           <div style={{ marginTop: 12 }}>
             <button className="btn" onClick={() => setSearchQuery('')}>
               Clear Search
@@ -804,13 +909,10 @@ export default function Dashboard() {
             setAddDefaultGroup('')
           }}
           onCreated={(acc) => {
+            // The countdown effect fetches the new account's first code.
             setAccounts((list) => [acc, ...list])
             setShowAdd(false)
             setAddDefaultGroup('')
-            // Fetch code for newly created account
-            api.getCode(acc.id).then((codeData) => {
-              setCodes((prev) => ({ ...prev, [acc.id]: codeData }))
-            }).catch((e) => console.error(e))
           }}
         />
       )}
@@ -827,6 +929,7 @@ export default function Dashboard() {
           onClose={() => setShowNewGroupModal(false)}
         />
       )}
+      </main>
     </div>
   )
 }

@@ -12,51 +12,13 @@ import {
   reorderAccountsByUser,
 } from '../lib/supabase.js'
 import { getVaultKeyFromReq, getUserIdFromReq } from '../lib/auth.js'
-import { MAX_LOGO_DATA_URI } from '../lib/limits.js'
-
-// ── L3 FIX: UUID format validation to prevent malformed IDs reaching DB ───────
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+import { UUID_RE, sanitizeString, normalizeLogo, normalizeBase32Secret } from '../lib/validate.js'
 
 const router = Router()
 
-// Remove null bytes and other ASCII control characters from user input.
-// Built with String.fromCharCode so the linter doesn't flag a control-char regex.
-const CTRL_CHARS = new RegExp(
-  `[${[0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127].map((n) => `\\x${n.toString(16).padStart(2, '0')}`).join('')}]`,
-  'g'
-)
-function sanitizeString(value) {
-  if (typeof value !== 'string') return ''
-  return value.replace(CTRL_CHARS, '')
-}
-
-// Validate and normalize a logo string. Accepts a known brand key, a
-// data: URI, or an http(s) URL. Rejects anything else.
-function normalizeLogo(value) {
-  const raw = sanitizeString(value).slice(0, 2048).trim()
-  if (!raw) return ''
-  if (raw.startsWith('data:image/')) {
-    // Only allow well-formed image/* data URIs. The client downscales uploads
-    // to 256x256, so MAX_LOGO_DATA_URI is generous headroom rather than a
-    // ceiling users hit in practice.
-    const comma = raw.indexOf(',')
-    if (comma === -1) return ''
-    if (raw.length > MAX_LOGO_DATA_URI) return ''
-    return raw
-  }
-  if (/^https?:\/\//i.test(raw)) {
-    try {
-      const u = new URL(raw)
-      if (!/^https?:$/i.test(u.protocol)) return ''
-      return u.toString()
-    } catch {
-      return ''
-    }
-  }
-  // Otherwise expect a short alphanumeric brand key
-  if (/^[a-z0-9_-]{1,32}$/i.test(raw)) return raw
-  return ''
+const clampInt = (value, min, max, fallback) => {
+  const n = Math.round(Number(value))
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
 }
 
 function sanitizeInput(body) {
@@ -76,37 +38,28 @@ function sanitizeInput(body) {
   if (!label || typeof label !== 'string') throw new Error('label is required')
   if (!secret || typeof secret !== 'string') throw new Error('secret is required')
 
-  const cleanLabel = sanitizeString(label).slice(0, 64)
+  const cleanLabel = sanitizeString(label).trim().slice(0, 64)
   if (!cleanLabel) throw new Error('label is required')
 
-  const cleanSecret = secret.replace(/\s+/g, '').toUpperCase()
+  const cleanSecret = normalizeBase32Secret(secret)
+  if (!cleanSecret) throw new Error('Invalid base32 secret')
   try {
-    Secret.fromBase32(cleanSecret.replace(/[^A-Z2-7=]/gi, ''))
+    if (Secret.fromBase32(cleanSecret).buffer.byteLength === 0) throw new Error()
   } catch {
-    try {
-      Secret.base32(cleanSecret)
-    } catch {
-      throw new Error('Invalid base32 secret')
-    }
+    throw new Error('Invalid base32 secret')
   }
-  const t = type === 'hotp' ? 'hotp' : 'totp'
-  const d = Number.isFinite(+digits) ? Math.min(8, Math.max(6, +digits)) : 6
-  const p = Number.isFinite(+period) ? Math.min(60, Math.max(15, +period)) : 30
-  const alg = ['SHA1', 'SHA256', 'SHA512'].includes(algorithm) ? algorithm : 'SHA1'
-  const c = Number.isFinite(+counter) ? Math.max(0, Math.min(1_000_000, +counter)) : 0
-  const grp = sanitizeString(group_name || group || '').trim().slice(0, 64)
-  const lgo = normalizeLogo(logo)
+  const alg = String(algorithm).toUpperCase()
   return {
     label: cleanLabel,
-    issuer: sanitizeString(issuer).slice(0, 64),
+    issuer: sanitizeString(issuer).trim().slice(0, 64),
     secret: cleanSecret,
-    type: t,
-    digits: d,
-    period: p,
-    algorithm: alg,
-    counter: c,
-    group_name: grp,
-    logo: lgo,
+    type: type === 'hotp' ? 'hotp' : 'totp',
+    digits: clampInt(digits, 6, 8, 6),
+    period: clampInt(period, 15, 60, 30),
+    algorithm: ['SHA1', 'SHA256', 'SHA512'].includes(alg) ? alg : 'SHA1',
+    counter: clampInt(counter, 0, 1_000_000, 0),
+    group_name: sanitizeString(group_name || group || '').trim().slice(0, 64),
+    logo: normalizeLogo(logo),
   }
 }
 
@@ -211,24 +164,29 @@ router.patch('/:id', async (req, res) => {
     if (!existing) return res.status(404).json({ error: 'Not found' })
 
     const updates = {}
-    if (req.body.label !== undefined) {
-      const l = sanitizeString(req.body.label).trim().slice(0, 64)
+    const body = req.body || {}
+    if (body.label !== undefined) {
+      const l = sanitizeString(body.label).trim().slice(0, 64)
       if (!l) return res.status(400).json({ error: 'label cannot be empty' })
       updates.label = l
     }
-    if (req.body.issuer !== undefined) {
-      updates.issuer = sanitizeString(req.body.issuer).trim().slice(0, 64)
+    if (body.issuer !== undefined) {
+      updates.issuer = sanitizeString(body.issuer).trim().slice(0, 64)
     }
-    if (req.body.group_name !== undefined || req.body.group !== undefined) {
+    if (body.group_name !== undefined || body.group !== undefined) {
       updates.group_name = sanitizeString(
-        req.body.group_name ?? req.body.group ?? ''
+        body.group_name ?? body.group ?? ''
       )
         .trim()
         .slice(0, 64)
     }
-    if (req.body.logo !== undefined) {
-      const lgo = normalizeLogo(req.body.logo)
+    if (body.logo !== undefined) {
+      const lgo = normalizeLogo(body.logo)
       updates.logo = lgo
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' })
     }
 
     const updated = await updateAccount(userId, id, updates)

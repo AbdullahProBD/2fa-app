@@ -15,6 +15,7 @@ export default function Select({
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  const btnRef = useRef(null)
 
   const selected = options.find((o) => String(o.value) === String(value))
 
@@ -24,7 +25,21 @@ export default function Select({
       if (ref.current && !ref.current.contains(e.target)) setOpen(false)
     }
     function onKey(e) {
-      if (e.key === 'Escape') setOpen(false)
+      if (e.key === 'Escape') {
+        // Close only the dropdown, not the dialog it lives in.
+        e.stopPropagation()
+        setOpen(false)
+        btnRef.current?.focus()
+        return
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        const items = Array.from(ref.current?.querySelectorAll('[role="option"]') || [])
+        if (items.length === 0) return
+        e.preventDefault()
+        const i = items.indexOf(document.activeElement)
+        const next = e.key === 'ArrowDown' ? i + 1 : i - 1
+        items[(next + items.length) % items.length].focus()
+      }
     }
     document.addEventListener('mousedown', onDocClick)
     document.addEventListener('keydown', onKey)
@@ -32,11 +47,12 @@ export default function Select({
       document.removeEventListener('mousedown', onDocClick)
       document.removeEventListener('keydown', onKey)
     }
-  }, [open ])
+  }, [open])
 
   return (
     <div className={`custom-select ${open ? 'open' : ''}`} ref={ref}>
       <button
+        ref={btnRef}
         type="button"
         className="custom-select-btn"
         aria-label={ariaLabel}

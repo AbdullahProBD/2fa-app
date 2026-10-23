@@ -1,9 +1,10 @@
 import { Router } from 'express'
-import { buildCsrfCookie } from '../lib/auth.js'
+import { buildCsrfCookie, getSession, csrfTokenForSession } from '../lib/auth.js'
 
 const router = Router()
 
-// Issues (or re-issues) the CSRF token. Requires a valid session.
+// Re-issues the session-bound CSRF token (same value for the life of the
+// session). Requires a valid session.
 // The token is returned in the JSON body AND set as a non-HttpOnly
 // cookie so the browser can echo it back in the X-CSRF-Token header.
 //
@@ -13,7 +14,9 @@ const router = Router()
 // certain embedded / preview-URL scenarios on Vercel). The client
 // retries the original failed request after fetching a fresh token.
 router.get('/', (req, res) => {
-  const csrf = buildCsrfCookie()
+  const session = getSession(req)
+  if (!session) return res.status(401).json({ error: 'Unauthorized' })
+  const csrf = buildCsrfCookie(csrfTokenForSession(session))
   res.setHeader('Set-Cookie', csrf.cookie)
   return res.status(200).json({ csrfToken: csrf.token })
 })

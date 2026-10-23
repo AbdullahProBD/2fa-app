@@ -8,18 +8,12 @@ import {
   reorderGroupsByUser,
 } from '../lib/supabase.js'
 import { getVaultKeyFromReq, getUserIdFromReq } from '../lib/auth.js'
-import { MAX_LOGO_DATA_URI } from '../lib/limits.js'
+import { sanitizeString, normalizeLogo } from '../lib/validate.js'
 
 const router = Router()
 
 // Group IDs are short slugs (client-generated) or default "grp_*" — bound length
 const GROUP_ID_RE = /^[A-Za-z0-9_:-]{1,64}$/
-
-// Built with String.fromCharCode so the linter doesn't flag a control-char regex.
-const CTRL_CHARS = new RegExp(
-  `[${[0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127].map((n) => `\\x${n.toString(16).padStart(2, '0')}`).join('')}]`,
-  'g'
-)
 
 function sanitizeGroupId(value) {
   if (typeof value !== 'string') return null
@@ -29,27 +23,7 @@ function sanitizeGroupId(value) {
 }
 
 function sanitizeGroupName(value) {
-  if (typeof value !== 'string') return ''
-  return value.replace(CTRL_CHARS, '').trim()
-}
-
-function sanitizeLogo(value) {
-  if (typeof value !== 'string') return ''
-  const v = value.replace(CTRL_CHARS, '').trim().slice(0, 2048)
-  if (!v) return ''
-  // The client downscales uploads to 256x256 before sending, so this ceiling is
-  // generous headroom rather than a limit users hit in practice. It still bounds
-  // what a single row can store.
-  if (v.startsWith('data:image/')) return v.length <= MAX_LOGO_DATA_URI ? v : ''
-  if (/^https?:\/\//i.test(v)) {
-    try {
-      return new URL(v).toString()
-    } catch {
-      return ''
-    }
-  }
-  if (/^[a-z0-9_-]{1,32}$/i.test(v)) return v
-  return ''
+  return sanitizeString(value).trim()
 }
 
 // GET /api/groups — fetch all custom groups for authenticated user
@@ -80,9 +54,9 @@ router.post('/', async (req, res) => {
   if (!trimmed) {
     return res.status(400).json({ error: 'Group name is required' })
   }
-  const sanitizedLogo = sanitizeLogo(logo)
-  // Server-generated ID is preferred. Reject client-supplied IDs to prevent
-  // collision / injection of arbitrary strings into the DB primary key.
+  const sanitizedLogo = normalizeLogo(logo)
+  // Client IDs are accepted only if they match the slug pattern; createGroup
+  // falls back to a server ID if one is already taken.
   const safeId = sanitizeGroupId(id)
   try {
     const group = await createGroup(userId, {
@@ -144,7 +118,7 @@ router.put('/:id', async (req, res) => {
     if (!trimmed) return res.status(400).json({ error: 'Group name is required' })
     updates.name = trimmed
   }
-  if (logo !== undefined) updates.logo = sanitizeLogo(logo)
+  if (logo !== undefined) updates.logo = normalizeLogo(logo)
   // Accepts only a real boolean — anything else (string "true", 1, null) is
   // rejected so a malformed client can't silently flip the accordion state.
   if (collapsed !== undefined) {

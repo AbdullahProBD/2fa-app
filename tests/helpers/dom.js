@@ -24,7 +24,12 @@ export function installLocalStorage() {
 export function installFetch() {
   globalThis.fetch = async (path, options = {}) => {
     fetchCalls.push({ path, body: options.body, method: options.method })
-    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+      text: async () => JSON.stringify({ ok: true }),
+    }
   }
   return fetchCalls
 }

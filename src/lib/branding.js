@@ -66,7 +66,7 @@ const SERVICES = {
 function lookup(issuer) {
   if (!issuer) return null
   const key = issuer.toLowerCase().trim()
-  if (SERVICES[key]) return SERVICES[key]
+  if (Object.prototype.hasOwnProperty.call(SERVICES, key)) return SERVICES[key]
   // Try matching any service name in the issuer string
   for (const [k, v] of Object.entries(SERVICES)) {
     if (key.includes(k)) return v
@@ -99,7 +99,7 @@ export function groupAccounts(accounts) {
     .map(([key, items]) => ({
       key,
       meta: issuerMeta(key),
-      items: items.sort((a, b) => a.label.localeCompare(b.label)),
+      items: items.sort((a, b) => (a.label || '').localeCompare(b.label || '')),
     }))
     .sort((a, b) => a.meta.name.localeCompare(b.meta.name))
 }

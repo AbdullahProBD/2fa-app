@@ -29,14 +29,15 @@
     <meta name="twitter:description" content="Self-hosted encrypted vault for your two-factor codes. TOTP/HOTP, groups, live QR scanning." />
 
     <meta name="referrer" content="no-referrer" />
-    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
-    <!-- NOTE: Permissions-Policy in <meta> is ignored by browsers (header-only).
-         The enforced policy is sent as an HTTP header (see server/index.js and
-         vercel.json). camera=(self) so the in-app QR scanner is allowed. -->
-    <meta http-equiv="Permissions-Policy" content="camera=(self), microphone=(), geolocation=(), interest-cohort=()" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="format-detection" content="telephone=no" />
+    <!-- Security headers (nosniff, Permissions-Policy with camera=(self) for the
+         QR scanner, CSP) are only honoured as HTTP response headers, so they are
+         set in server/index.js and vercel.json rather than via <meta>. -->
   </head>
   <body>
     <div id="root"></div>
+    <noscript>2FA Vault needs JavaScript enabled to run.</noscript>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

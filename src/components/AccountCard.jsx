@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faCopy, faCheck, faPenToSquare, faXmark } from '@fortawesome/free-solid-svg-icons'
 import Countdown from './Countdown.jsx'
@@ -6,6 +6,7 @@ import { ServiceLogo } from '../lib/icons.jsx'
 import DeleteModal from './DeleteModal.jsx'
 import EditAccountModal from './EditAccountModal.jsx'
 import { api } from '../lib/api.js'
+import { copyText } from '../lib/clipboard.js'
 
 export default function AccountCard({
   account,
@@ -24,31 +25,46 @@ export default function AccountCard({
   const [hotpCounter, setHotpCounter] = useState(account.counter ?? 0)
   const [manualCode, setManualCode] = useState(null)
   const [loadingCode, setLoadingCode] = useState(false)
+  const [copyFailed, setCopyFailed] = useState(false)
+  const copiedTimer = useRef(0)
+
+  useEffect(() => () => clearTimeout(copiedTimer.current), [])
 
   const code = manualCode || liveCode
 
   async function copyCode(e) {
     if (e) e.stopPropagation()
     if (!code) return
-    try {
-      await navigator.clipboard.writeText(code)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1600)
-    } catch (err) {
-      console.error('Clipboard copy failed', err)
+    const ok = await copyText(code)
+    setCopied(ok)
+    setCopyFailed(!ok)
+    clearTimeout(copiedTimer.current)
+    copiedTimer.current = setTimeout(() => {
+      setCopied(false)
+      setCopyFailed(false)
+    }, 1600)
+  }
+
+  // Only react to keys pressed on the card itself, not on the nested buttons.
+  function onActivateKey(e) {
+    if (e.target !== e.currentTarget) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      copyCode(e)
     }
   }
 
   async function handleNextHotp(e) {
     e.stopPropagation()
+    if (loadingCode) return
     setLoadingCode(true)
     try {
       const nextCounter = Number(hotpCounter) + 1
       const res = await api.getCode(account.id, nextCounter)
       setManualCode(res.code)
       setHotpCounter(nextCounter)
-    } catch (e) {
-      console.error(e)
+    } catch (err) {
+      console.error('Failed to generate next HOTP code', err?.message)
     } finally {
       setLoadingCode(false)
     }
@@ -80,15 +96,10 @@ export default function AccountCard({
       <div
         className={`account-card ${copied ? 'copied-flash' : ''}`}
         onClick={copyCode}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            copyCode(e)
-          }
-        }}
+        onKeyDown={onActivateKey}
         role="button"
         tabIndex={0}
-        title="Tap to copy code"
+        title={copyFailed ? 'Copy failed — select the code manually' : 'Tap to copy code'}
         aria-label={`Copy code for ${account.label}`}
       >
         {/* Left: Logo & Account Info */}
@@ -108,9 +119,18 @@ export default function AccountCard({
                 <span
                   className="account-group-tag"
                   style={{ cursor: 'pointer' }}
+                  role="button"
+                  tabIndex={0}
                   onClick={(e) => {
                     e.stopPropagation()
                     setShowEditModal(true)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setShowEditModal(true)
+                    }
                   }}
                   title="Click to change group"
                 >
@@ -120,7 +140,7 @@ export default function AccountCard({
             </div>
             <div className="account-meta-text">
               {account.issuer ? `${account.issuer} · ` : ''}
-              {account.type.toUpperCase()} · {account.digits}d · {account.algorithm}
+              {String(account.type || 'totp').toUpperCase()} · {account.digits}d · {account.algorithm}
             </div>
           </div>
         </div>
@@ -135,12 +155,7 @@ export default function AccountCard({
                 title="Click to copy code"
                 role="button"
                 tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault()
-                    copyCode(e)
-                  }
-                }}
+                onKeyDown={onActivateKey}
               >
                 {formatCode(code)}
               </div>
@@ -161,12 +176,7 @@ export default function AccountCard({
                 title="Click to copy code"
                 role="button"
                 tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault()
-                    copyCode(e)
-                  }
-                }}
+                onKeyDown={onActivateKey}
               >
                 {formatCode(code)}
               </div>

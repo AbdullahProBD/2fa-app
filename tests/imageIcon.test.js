@@ -4,7 +4,10 @@ import {
   normalizeIconUrl,
   MAX_ICON_DIMENSION,
   MAX_UPLOAD_BYTES,
+  MAX_ICON_DATA_URI,
   ACCEPTED_IMAGE_TYPES,
+  dataUrlMime,
+  withMime,
 } from '../src/lib/imageResize.js'
 import { MAX_LOGO_DATA_URI } from '../server/lib/limits.js'
 
@@ -16,11 +19,18 @@ describe('normalizeIconUrl', () => {
     )
   })
 
-  test('accepts an http URL', () => {
-    assert.equal(
-      normalizeIconUrl('http://example.com/logo.png'),
-      'http://example.com/logo.png'
-    )
+  // The server's normalizeLogo() drops http:// and the CSP blocks it as mixed
+  // content, so the picker must refuse it up front instead of losing the icon.
+  test('rejects an http URL', () => {
+    assert.throws(() => normalizeIconUrl('http://example.com/logo.png'), /https/)
+  })
+
+  test('rejects URLs with embedded credentials', () => {
+    assert.throws(() => normalizeIconUrl('https://user:pw@example.com/a.png'), /username or password/)
+  })
+
+  test('rejects over-long URLs', () => {
+    assert.throws(() => normalizeIconUrl('https://example.com/' + 'a'.repeat(2100)), /too long/)
   })
 
   test('trims surrounding whitespace', () => {
@@ -77,5 +87,23 @@ describe('icon limits', () => {
     for (const t of ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml']) {
       assert.ok(ACCEPTED_IMAGE_TYPES.includes(t), `missing ${t}`)
     }
+  })
+})
+
+describe('data URI helpers', () => {
+  test('MAX_ICON_DATA_URI matches the server cap', () => {
+    assert.equal(MAX_ICON_DATA_URI, MAX_LOGO_DATA_URI)
+  })
+
+  test('dataUrlMime reads the declared type', () => {
+    assert.equal(dataUrlMime('data:image/PNG;base64,AAAA'), 'image/png')
+    assert.equal(dataUrlMime('data:;base64,AAAA'), '')
+    assert.equal(dataUrlMime('nope'), '')
+    assert.equal(dataUrlMime(null), '')
+  })
+
+  test('withMime replaces an empty or wrong type', () => {
+    assert.equal(withMime('data:application/octet-stream;base64,AAAA', 'image/png'), 'data:image/png;base64,AAAA')
+    assert.equal(withMime('data:;base64,AAAA', 'image/svg+xml'), 'data:image/svg+xml;base64,AAAA')
   })
 })

@@ -1,8 +1,18 @@
 import { useState, useRef, useEffect } from 'react'
-import { createPortal } from 'react-dom'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faQrcode, faPlus, faCamera, faRotateRight } from '@fortawesome/free-solid-svg-icons'
 import jsQR from 'jsqr'
+import { api } from '../lib/api.js'
+import { getBrand, ServiceLogo, detectService } from '../lib/icons.jsx'
+import { getCustomGroups, createCustomGroup, setAccountMeta } from '../lib/groupsStorage.js'
+import GroupModal from './GroupModal.jsx'
+import IconPickerModal from './IconPickerModal.jsx'
+import { normalizeSecret, validateSecret } from '../lib/otp.js'
+import Modal from './Modal.jsx'
+import Select from './Select.jsx'
+
+const MAX_QR_IMAGE_BYTES = 20 * 1024 * 1024
+const MAX_QR_IMAGE_PIXELS = 50_000_000
 
 const QR_DECODE_OPTS = { inversionAttempts: 'attemptBoth' }
 
@@ -14,8 +24,11 @@ function CameraScanner({ onDetected }) {
   const [status, setStatus] = useState('starting') // starting | scanning | error
   const [errMsg, setErrMsg] = useState('')
   const [attempt, setAttempt] = useState(0)
+  const onDetectedRef = useRef(onDetected)
+  onDetectedRef.current = onDetected
 
   useEffect(() => {
+    const video = videoRef.current
     let stream = null
     let raf = 0
     let lastRun = 0
@@ -40,7 +53,6 @@ function CameraScanner({ onDetected }) {
           stream.getTracks().forEach((t) => t.stop())
           return
         }
-        const video = videoRef.current
         if (!video) return
         video.srcObject = stream
         // Set via property: React's `muted` prop only sets the attribute,
@@ -73,7 +85,8 @@ function CameraScanner({ onDetected }) {
             if (code && code.data) {
               stopped = true
               cancelAnimationFrame(raf)
-              onDetected(code.data)
+              stream?.getTracks().forEach((t) => t.stop())
+              onDetectedRef.current(code.data)
             }
           } catch {
             // ignore per-frame errors, keep scanning
@@ -98,12 +111,9 @@ function CameraScanner({ onDetected }) {
       stopped = true
       cancelAnimationFrame(raf)
       if (stream) stream.getTracks().forEach((t) => t.stop())
-      if (videoRef.current) videoRef.current.srcObject = null
+      if (video) video.srcObject = null
     }
     // `attempt` re-runs the whole startup for the Retry button.
-    // onDetected is captured from the first render on purpose — it only
-    // uses stable setState setters, `api`, and `applyParsedData`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attempt])
 
   if (status === 'error') {
@@ -137,19 +147,13 @@ function CameraScanner({ onDetected }) {
     </div>
   )
 }
-import { api } from '../lib/api.js'
-import { BRAND_ICONS, ServiceLogo, detectService } from '../lib/icons.jsx'
-import { getCustomGroups, createCustomGroup, setAccountMeta } from '../lib/groupsStorage.js'
-import GroupModal from './GroupModal.jsx'
-import IconPickerModal from './IconPickerModal.jsx'
-import Select from './Select.jsx'
-
 export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
   const [tab, setTab] = useState('qr')
   const [drag, setDrag] = useState(false)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const fileRef = useRef()
+  const busyRef = useRef(false)
 
   const [form, setForm] = useState({
     label: '',
@@ -179,7 +183,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
   function update(k, v) {
     setForm((f) => {
       const next = { ...f, [k]: v }
-      if (k === 'issuer' && (!f.logo || BRAND_ICONS[f.logo])) {
+      if (k === 'issuer' && (!f.logo || getBrand(f.logo))) {
         const auto = detectService(v)
         if (auto) next.logo = auto
       }
@@ -241,6 +245,9 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
     const H = img.naturalHeight || img.height
     if (!W || !H) {
       throw new Error('Could not read that image. Please use a PNG, JPEG, or WebP file.')
+    }
+    if (W * H > MAX_QR_IMAGE_PIXELS) {
+      throw new Error('That image is too large to scan. Please use a smaller screenshot.')
     }
 
     const fit = (maxDim) => {
@@ -308,6 +315,12 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       setErr('Please choose an image file (PNG, JPG, WebP)')
       return
     }
+    if (file.size > MAX_QR_IMAGE_BYTES) {
+      setErr('That image is too large. Please pick one under 20 MB.')
+      return
+    }
+    if (busyRef.current) return
+    busyRef.current = true
     setErr('')
     setLoading(true)
 
@@ -343,6 +356,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
     } catch (e) {
       setErr(e.message || 'Could not scan QR code. Please try pasting the URI or manual entry.')
     } finally {
+      busyRef.current = false
       setLoading(false)
       // Clear the input so picking the same file again re-triggers onChange
       // instead of silently doing nothing.
@@ -356,19 +370,22 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       ...f,
       label: data.label || f.label,
       issuer: data.issuer || f.issuer,
-      secret: data.secret,
-      type: data.type || 'totp',
+      secret: data.secret || '',
+      type: data.type === 'hotp' ? 'hotp' : 'totp',
       digits: data.digits || 6,
       period: data.period || 30,
       algorithm: data.algorithm || 'SHA1',
       counter: data.counter || 0,
-      logo: autoLogo,
+      // Keep a custom (uploaded / URL) icon the user already picked.
+      logo: autoLogo || (f.logo && !getBrand(f.logo) ? f.logo : ''),
     }))
+    setErr('')
     setTab('manual')
   }
 
   async function parseUriNow() {
-    if (!uri.trim()) return
+    if (!uri.trim() || busyRef.current) return
+    busyRef.current = true
     setErr('')
     try {
       setLoading(true)
@@ -377,6 +394,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
     } catch (e) {
       setErr(e.message)
     } finally {
+      busyRef.current = false
       setLoading(false)
     }
   }
@@ -386,6 +404,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
   // On failure we remount the scanner so the user can try again.
   const [scanKey, setScanKey] = useState(0)
   async function handleScannedData(data) {
+    busyRef.current = true
     setErr('')
     setLoading(true)
     try {
@@ -398,6 +417,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       )
       setScanKey((k) => k + 1) // remount scanner for another attempt
     } finally {
+      busyRef.current = false
       setLoading(false)
     }
   }
@@ -409,15 +429,20 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       setErr('Label is required')
       return
     }
-    if (!form.secret.trim()) {
-      setErr('Secret is required')
+    const secret = normalizeSecret(form.secret)
+    const secretErr = validateSecret(secret)
+    if (secretErr) {
+      setErr(secretErr)
       return
     }
+    if (busyRef.current) return
+    busyRef.current = true
 
     try {
       setLoading(true)
       const payload = {
         ...form,
+        secret,
         label: form.label.trim(),
         issuer: form.issuer.trim(),
         group_name: form.group,
@@ -440,27 +465,57 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
     } catch (e) {
       setErr(e.message)
     } finally {
+      busyRef.current = false
       setLoading(false)
     }
   }
 
-  const modal = (
+  return (
     <>
-      <div className="modal-backdrop" onClick={onClose} style={{ zIndex: 1000 }}>
-        <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
+      <Modal
+        onClose={onClose}
+        dismissible={!loading}
+        ariaLabel="Add 2FA account"
+        style={{ maxWidth: 520 }}
+        backdropStyle={{ zIndex: 1000 }}
+      >
           <h2>Add 2FA Account</h2>
-          <div className="tabs">
-            <button className={`tab ${tab === 'qr' ? 'active' : ''}`} onClick={() => setTab('qr')}>
+          <div className="tabs" role="tablist" aria-label="Add account method">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'qr'}
+              className={`tab ${tab === 'qr' ? 'active' : ''}`}
+              onClick={() => setTab('qr')}
+            >
               Upload QR Image
             </button>
-            <button className={`tab ${tab === 'scan' ? 'active' : ''}`} onClick={() => setTab('scan')}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'scan'}
+              className={`tab ${tab === 'scan' ? 'active' : ''}`}
+              onClick={() => setTab('scan')}
+            >
               <FontAwesomeIcon icon={faCamera} style={{ fontSize: 12, marginRight: 4 }} />
               Scan Camera
             </button>
-            <button className={`tab ${tab === 'uri' ? 'active' : ''}`} onClick={() => setTab('uri')}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'uri'}
+              className={`tab ${tab === 'uri' ? 'active' : ''}`}
+              onClick={() => setTab('uri')}
+            >
               Paste URI
             </button>
-            <button className={`tab ${tab === 'manual' ? 'active' : ''}`} onClick={() => setTab('manual')}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'manual'}
+              className={`tab ${tab === 'manual' ? 'active' : ''}`}
+              onClick={() => setTab('manual')}
+            >
               Manual Entry
             </button>
           </div>
@@ -469,7 +524,16 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
           {tab === 'qr' && (
             <div
               className={`dropzone ${drag ? 'drag' : ''}`}
+              role="button"
+              tabIndex={0}
+              aria-label="Choose a QR code image"
               onClick={() => fileRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                  e.preventDefault()
+                  fileRef.current?.click()
+                }
+              }}
               onDragOver={(e) => {
                 e.preventDefault()
                 setDrag(true)
@@ -525,6 +589,7 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
                 onChange={(e) => setUri(e.target.value)}
               />
               <button
+                type="button"
                 className="btn btn-primary"
                 style={{ marginTop: 10 }}
                 onClick={parseUriNow}
@@ -543,7 +608,16 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
                 <label className="label">Icon / Logo</label>
                 <div
                   className="icon-picker-trigger"
+                  role="button"
+                  tabIndex={0}
+                  aria-label="Choose icon"
                   onClick={() => setShowIconPicker(true)}
+                  onKeyDown={(e) => {
+                    if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                      e.preventDefault()
+                      setShowIconPicker(true)
+                    }
+                  }}
                 >
                   <div className="icon-picker-trigger-left">
                     <ServiceLogo
@@ -554,8 +628,8 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
                     />
                     <div>
                       <div style={{ fontSize: 14, fontWeight: 600 }}>
-                        {form.logo && BRAND_ICONS[form.logo]
-                          ? BRAND_ICONS[form.logo].name
+                        {form.logo && getBrand(form.logo)
+                          ? getBrand(form.logo).name
                           : form.logo
                           ? 'Custom Logo'
                           : 'Auto / Initials'}
@@ -601,6 +675,10 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
                   onChange={(e) => update('secret', e.target.value)}
                   placeholder="JBSWY3DPEHPK3PXP"
                   required
+                  autoComplete="off"
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
                   style={{ fontFamily: 'monospace' }}
                 />
               </div>
@@ -697,7 +775,9 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
                       type="number"
                       min={0}
                       value={form.counter}
-                      onChange={(e) => update('counter', +e.target.value)}
+                      onChange={(e) =>
+                      update('counter', Math.max(0, Math.floor(Number(e.target.value)) || 0))
+                    }
                     />
                   </div>
                   <div className="field">
@@ -718,20 +798,19 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
             </form>
           )}
 
-          {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+          {err && <div className="error" role="alert" style={{ marginTop: 12 }}>{err}</div>}
 
           <div className="modal-actions">
-            <button className="btn btn-ghost" onClick={onClose} disabled={loading}>
+            <button type="button" className="btn btn-ghost" onClick={onClose} disabled={loading}>
               Cancel
             </button>
             {tab === 'manual' && (
-              <button className="btn btn-primary" onClick={submit} disabled={loading}>
+              <button type="button" className="btn btn-primary" onClick={submit} disabled={loading}>
                 {loading ? 'Saving…' : 'Save Account'}
               </button>
             )}
           </div>
-        </div>
-      </div>
+      </Modal>
 
       {/* Icon Picker Popup Modal */}
       <IconPickerModal
@@ -758,6 +837,4 @@ export default function AddAccount({ onClose, onCreated, defaultGroup = '' }) {
       )}
     </>
   )
-
-  return createPortal(modal, document.body)
 }

@@ -1,17 +1,18 @@
 import { Router } from 'express'
-import { checkConfig, bootstrapUser, authenticateAndUnlock } from '../lib/users.js'
-import { signSession, buildCookie, buildCsrfCookie } from '../lib/auth.js'
+import {
+  checkConfig,
+  bootstrapUser,
+  authenticateAndUnlock,
+  dummyPasswordCheck,
+  safeStringEqual,
+} from '../lib/users.js'
+import { createSession, buildCookie, buildCsrfCookie } from '../lib/auth.js'
 import { getUserByUsername } from '../lib/supabase.js'
+import { sanitizeString } from '../lib/validate.js'
 
 const router = Router()
 
-// Built with String.fromCharCode so the linter doesn't flag a control-char regex.
-const CTRL_CHARS = new RegExp(
-  `[${[0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127].map((n) => `\\x${n.toString(16).padStart(2, '0')}`).join('')}]`,
-  'g'
-)
-
-// ── H1 FIX: Rate limiting is applied globally in server/index.js on /api/login
+// Rate limiting is applied in server/index.js on /api/login.
 
 router.post('/', async (req, res) => {
   const cfg = checkConfig()
@@ -34,14 +35,14 @@ router.post('/', async (req, res) => {
   }
 
   // Strip null bytes / control characters from username to prevent smuggling
-  const cleanUsername = username.replace(CTRL_CHARS, '')
-  if (cleanUsername !== username) {
+  if (sanitizeString(username) !== username) {
     return res.status(400).json({ error: 'Invalid credentials' })
   }
 
-  // Constant-time username check — always wait the same amount before rejection
-  if (username !== cfg.username) {
-    await new Promise((r) => setTimeout(r, 400))
+  // Constant-time username check; a mismatch still pays for a bcrypt compare so
+  // response time doesn't reveal whether the username was right.
+  if (!safeStringEqual(username, cfg.username)) {
+    await dummyPasswordCheck(password)
     return res.status(401).json({ error: 'Invalid credentials' })
   }
 
@@ -59,8 +60,8 @@ router.post('/', async (req, res) => {
     }
 
     const { user, vaultKey } = result
-    const token = signSession({ userId: user.id, vaultKey })
-    const csrf = buildCsrfCookie()
+    const { token, csrfToken } = createSession({ userId: user.id, vaultKey })
+    const csrf = buildCsrfCookie(csrfToken)
     res.setHeader('Set-Cookie', [buildCookie(token), csrf.cookie])
     return res.status(200).json({ ok: true, csrfToken: csrf.token })
   } catch (err) {

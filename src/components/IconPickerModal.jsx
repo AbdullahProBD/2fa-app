@@ -1,5 +1,4 @@
 import { useState, useMemo, useRef } from 'react'
-import { createPortal } from 'react-dom'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import {
   faXmark,
@@ -10,6 +9,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons'
 import { BRAND_ICONS, ICON_CATEGORIES, ServiceLogo } from '../lib/icons.jsx'
 import { prepareIconUpload, normalizeIconUrl } from '../lib/imageResize.js'
+import Modal from './Modal.jsx'
 
 export default function IconPickerModal({
   isOpen,
@@ -97,17 +97,21 @@ export default function IconPickerModal({
 
   const urlPreviewable = urlError === '' && customUrl.trim() !== ''
 
-  const modalContent = (
-    <div className="modal-backdrop" onClick={onClose} style={{ zIndex: 1100 }}>
-      <div
+  return (
+      <Modal
+        onClose={onClose}
+        ariaLabel="Choose account icon"
         className="modal icon-picker-modal"
-        onClick={(e) => e.stopPropagation()}
+        backdropStyle={{ zIndex: 1100 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h2 style={{ margin: 0, fontSize: 18 }}>Choose Account Icon</h2>
           <button
+            type="button"
             className="btn-icon"
             onClick={onClose}
+            aria-label="Close"
+            title="Close"
             style={{ width: 28, height: 28 }}
           >
             <FontAwesomeIcon icon={faXmark} style={{ fontSize: 14 }} />
@@ -214,18 +218,27 @@ export default function IconPickerModal({
         {tab === 'url' && (
           <div style={{ padding: '8px 0' }}>
             <div className="field">
-              <label className="label">Logo Image URL</label>
+              <label className="label" htmlFor="icon-url-input">Logo Image URL</label>
               <input
+                id="icon-url-input"
                 className="input"
                 placeholder="https://example.com/logo.png"
                 value={customUrl}
                 onChange={(e) => handleUrlChange(e.target.value)}
                 autoFocus
+                autoComplete="off"
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    submitUrl()
+                  }
+                }}
               />
             </div>
 
             {urlError && (
-              <div className="error" style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+              <div className="error" role="alert" style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
                 <FontAwesomeIcon icon={faTriangleExclamation} style={{ marginTop: 2, flexShrink: 0 }} />
                 <span>{urlError}</span>
               </div>
@@ -307,9 +320,6 @@ export default function IconPickerModal({
             )}
           </div>
         )}
-      </div>
-    </div>
+      </Modal>
   )
-
-  return createPortal(modalContent, document.body)
 }

@@ -80,3 +80,39 @@ describe('crypto primitives', () => {
     assert.equal(generateVaultKey().length, 32)
   })
 })
+
+describe('crypto hardening', () => {
+  test('rejects a truncated GCM auth tag', () => {
+    const vaultKey = generateVaultKey()
+    const enc = encryptSecret('JBSWY3DPEHPK3PXP', vaultKey)
+    assert.throws(
+      () => decryptSecret({ ...enc, authTag: enc.authTag.subarray(0, 4) }, vaultKey),
+      /auth tag length/
+    )
+  })
+
+  test('rejects an IV of the wrong length', () => {
+    const vaultKey = generateVaultKey()
+    const enc = encryptSecret('JBSWY3DPEHPK3PXP', vaultKey)
+    assert.throws(() => decryptSecret({ ...enc, iv: Buffer.alloc(16) }, vaultKey), /IV length/)
+  })
+
+  test('decrypting with the wrong key fails', () => {
+    const enc = encryptSecret('JBSWY3DPEHPK3PXP', generateVaultKey())
+    assert.throws(() => decryptSecret(enc, generateVaultKey()))
+  })
+
+  test('deriveKek honours the iteration count (different counts, different keys)', async () => {
+    const salt = generateSalt()
+    const a = await deriveKek('pw', salt, 100000)
+    const b = await deriveKek('pw', salt, 110000)
+    assert.notEqual(Buffer.compare(a, b), 0)
+  })
+
+  test('deriveKek rejects weak or absurd iteration counts from the DB', async () => {
+    const salt = generateSalt()
+    await assert.rejects(deriveKek('pw', salt, 1))
+    await assert.rejects(deriveKek('pw', salt, 2 ** 40))
+    await assert.rejects(deriveKek('pw', salt, 'abc'))
+  })
+})

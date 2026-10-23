@@ -6,7 +6,8 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "orientation": "portrait",
+  "lang": "en",
+  "categories": ["security", "utilities"],
   "background_color": "#080c14",
   "theme_color": "#080c14",
   "icons": [

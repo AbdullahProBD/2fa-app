@@ -627,6 +627,14 @@ const MATCH_RULES = [
   { match: /authy/i, key: 'authy' },
 ]
 
+// Own-property lookup so keys like "constructor" or "__proto__" (which the
+// server accepts as brand keys) can't resolve to Object.prototype members.
+export function getBrand(key) {
+  return typeof key === 'string' && Object.prototype.hasOwnProperty.call(BRAND_ICONS, key)
+    ? BRAND_ICONS[key]
+    : null
+}
+
 export function detectService(nameOrIssuer = '') {
   if (!nameOrIssuer) return null
   for (const { match, key } of MATCH_RULES) {
@@ -678,7 +686,7 @@ export function ServiceLogo({
   const [imgError, setImgError] = useState(false)
 
   // 1. Explicit URL or data URI
-  const isUrl = logo && (logo.startsWith('http') || logo.startsWith('data:'))
+  const isUrl = typeof logo === 'string' && /^(https?:\/\/|data:image\/)/i.test(logo)
 
   // Reset the failure flag whenever the source changes. Without this, picking a
   // broken URL (e.g. a host with hotlink protection) permanently latched the
@@ -723,15 +731,15 @@ export function ServiceLogo({
   }
 
   // 2. Preset key or auto-detect
-  const brandKey = BRAND_ICONS[logo]
+  const brandKey = getBrand(logo)
     ? logo
     : detectService(issuer) || detectService(label)
 
   // A stored URL that failed to load is not a brand key, so skip straight to
   // the monogram rather than re-detecting a service from the label.
   const failedUrl = isUrl && imgError
-  if (!failedUrl && brandKey && BRAND_ICONS[brandKey]) {
-    const brand = BRAND_ICONS[brandKey]
+  if (!failedUrl && brandKey && getBrand(brandKey)) {
+    const brand = getBrand(brandKey)
     return (
       <div
         className={`service-logo ${className}`}

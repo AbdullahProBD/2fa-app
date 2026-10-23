@@ -26,7 +26,12 @@ export function getCustomGroups() {
     const raw = localStorage.getItem(GROUPS_STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) return parsed
+      // Drop malformed entries so callers can rely on `g.id` / `g.name` being strings.
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (g) => g && typeof g === 'object' && typeof g.id === 'string' && typeof g.name === 'string'
+        )
+      }
     }
   } catch (e) {
     console.error('Failed to read custom groups from localStorage', e)
@@ -44,13 +49,18 @@ export function saveCustomGroups(groups) {
 }
 
 // Merge groups retrieved from database into local cache
-export function syncGroupsFromBackend(backendGroups) {
+// `authoritative` (a full list from GET /api/groups) also drops local groups the
+// database no longer has; partial overlays leave local-only groups alone.
+export function syncGroupsFromBackend(backendGroups, { authoritative = false } = {}) {
   if (!Array.isArray(backendGroups)) return
   const local = getCustomGroups()
   const map = new Map()
+  // An empty list could also mean a missing table, so only prune when non-empty.
+  const backendIds = new Set(backendGroups.filter((g) => g && g.id).map((g) => g.id))
+  const prune = authoritative && backendIds.size > 0
   // 1. Add local groups
   local.forEach((g) => {
-    if (g && g.name) map.set(g.name.toLowerCase(), g)
+    if (g && g.name && !(prune && !backendIds.has(g.id))) map.set(g.name.toLowerCase(), g)
   })
   // 2. Overlay backend groups
   backendGroups.forEach((g) => {
@@ -241,7 +251,7 @@ export function setGroupCollapsed(groupId, collapsed) {
 
 export function forgetGroupCollapsed(groupId) {
   const map = getCollapsedMap()
-  if (!(groupId in map)) return map
+  if (!Object.prototype.hasOwnProperty.call(map, groupId)) return map
   delete map[groupId]
   return writeCollapsedMap(map)
 }
@@ -269,7 +279,7 @@ export function getAllAccountMeta() {
     const raw = localStorage.getItem(ACCOUNT_META_KEY)
     if (raw) {
       const parsed = JSON.parse(raw)
-      if (parsed && typeof parsed === 'object') return parsed
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
     }
   } catch (e) {
     console.error('Failed to read account metadata', e)
@@ -279,14 +289,16 @@ export function getAllAccountMeta() {
 
 export function getAccountMeta(accountId) {
   const all = getAllAccountMeta()
-  return all[accountId] || { group: '', logo: '' }
+  const own = Object.prototype.hasOwnProperty.call(all, accountId) ? all[accountId] : null
+  return own && typeof own === 'object' ? own : { group: '', logo: '' }
 }
 
 export function setAccountMeta(accountId, meta) {
   try {
     const all = getAllAccountMeta()
+    const prev = Object.prototype.hasOwnProperty.call(all, accountId) ? all[accountId] : null
     all[accountId] = {
-      ...(all[accountId] || {}),
+      ...(prev && typeof prev === 'object' ? prev : {}),
       ...meta,
     }
     localStorage.setItem(ACCOUNT_META_KEY, JSON.stringify(all))
@@ -341,6 +353,43 @@ export function getCachedGroupOrder() {
 export function setCachedGroupOrder(ids) {
   if (!Array.isArray(ids)) return
   writeOrder(GROUP_ORDER_KEY, ids)
+}
+
+// Returns a new list with `sourceId` and `targetId` swapped inside the section
+// whose group name is `groupName` ('' = ungrouped). Accounts in other sections
+// keep their exact positions. Returns null when there is nothing to swap.
+export function swapWithinGroup(accounts, groupName, sourceId, targetId) {
+  if (!Array.isArray(accounts) || sourceId === targetId) return null
+  const key = (groupName || '').toLowerCase()
+  const keyOf = (a) => (a.group || '').toLowerCase()
+  const slice = accounts.filter((a) => keyOf(a) === key)
+  const sIdx = slice.findIndex((a) => a.id === sourceId)
+  const tIdx = slice.findIndex((a) => a.id === targetId)
+  if (sIdx === -1 || tIdx === -1) return null
+  const swapped = slice.slice()
+  swapped[sIdx] = slice[tIdx]
+  swapped[tIdx] = slice[sIdx]
+  let i = 0
+  return accounts.map((a) => (keyOf(a) === key ? swapped[i++] : a))
+}
+
+// Wipes every per-user cache kept in localStorage. Called on logout / session
+// expiry so the next person on a shared browser doesn't see this vault's
+// group names, icons or layout. The database remains the source of truth.
+export function clearVaultCache() {
+  try {
+    for (const k of [
+      GROUPS_STORAGE_KEY,
+      ACCOUNT_META_KEY,
+      COLLAPSE_KEY,
+      ACCOUNT_ORDER_KEY,
+      GROUP_ORDER_KEY,
+    ]) {
+      localStorage.removeItem(k)
+    }
+  } catch (e) {
+    console.error('Failed to clear vault cache', e)
+  }
 }
 
 // Apply a cached order to a freshly-fetched list of items. Items not present

@@ -43,9 +43,16 @@ Instead, report vulnerabilities privately:
 * **Zero-Knowledge Encryption**: Secrets are encrypted at rest with AES-256-GCM using a 32-byte key derived from the master password (PBKDF2 with SHA-256, 310,000 iterations).
 * **Supabase Isolation**: The database only stores encrypted ciphertexts, IVs, and authentication tags. Even with full database access, secrets cannot be decrypted without the user's master password.
 * **Session Security**: Session tokens are signed using HS256, transmitted exclusively over HTTPS (`SameSite=Strict`, `HttpOnly`, `Secure` cookies). Vault key is bound to the session and AES-256-GCM-wrapped using an HKDF-derived key.
-* **CSRF Protection**: Double-submit-cookie CSRF tokens are required on every state-changing request. Tokens are tied to the session and validated with constant-time comparison.
-* **Rate Limiting**: Express rate limiting mitigates brute-force authentication attacks on all `/api/login` endpoints, plus per-endpoint throttling on write operations.
+* **CSRF Protection**: Every state-changing request needs an `X-CSRF-Token` header that matches the `2fa_csrf` cookie *and* an HMAC derived from the signed session, so cookies injected from a sibling subdomain cannot forge it. Comparisons are constant-time, cross-origin `Origin` headers are rejected in production, and only JSON bodies are accepted (no cross-site form posts).
+* **Rate Limiting**: Express rate limiting mitigates brute-force authentication attacks on `/api/login`, plus a coarse per-IP API ceiling and throttling on write operations. Set `TRUST_PROXY` when running behind a reverse proxy so limits apply per client IP.
 * **HTTP Hardening**: Helmet sets security headers (`Content-Security-Policy`, `X-Frame-Options: DENY`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`).
 * **Input Validation**: All UUIDs are format-validated, request bodies are size-limited (2 MB), and user-supplied strings are sanitized against control characters and oversized payloads.
 * **Information Leak Prevention**: Internal error messages and Supabase errors are not exposed to clients; admin user existence is not disclosed via the public `/api/mode` endpoint.
-* **Constant-Time Login**: A dummy bcrypt comparison is performed for unknown usernames to equalize login response times.
+* **Constant-Time Login**: A dummy bcrypt comparison (against a valid hash) is performed for wrong usernames to equalize login response times.
+* **Bootstrap Protection**: The first login creates the vault only when the supplied password equals `ADMIN_PASS`.
+* **Strict Crypto Parameters**: AES-GCM IVs (12 bytes) and auth tags (16 bytes) are length-checked on decrypt, JWTs are pinned to HS256, and the PBKDF2 iteration count stored per user is honoured (and upgraded on login) within sane bounds.
+* **Image Safety**: QR uploads are rejected before decoding when a PNG declares more than 4096×4096 / 12 MP; logos must be base64 image data URIs, `https:` URLs or short brand keys.
+
+### Known limitations
+* Sessions are stateless JWTs: logging out clears the cookie but cannot revoke a stolen token before its 24-hour expiry. Rotate `SESSION_SECRET` to invalidate all sessions.
+* Rate-limit counters are in memory; on serverless platforms they are per instance, so rely on a long `ADMIN_PASS` (16+ characters) and, if needed, a platform firewall.

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { createClient } from '@supabase/supabase-js'
 
 let _client = null
@@ -107,6 +108,7 @@ export async function updateUserWrappedKey(userId, data) {
       wrapped_vault_key: data.wrappedVaultKey,
       wrapped_vault_iv: data.wrappedVaultIv,
       wrapped_vault_tag: data.wrappedVaultTag,
+      ...(data.kekSalt ? { kek_salt: data.kekSalt, kek_iterations: data.kekIterations } : {}),
     })
     .eq('id', userId)
   if (error) throw error
@@ -195,6 +197,8 @@ export async function updateAccount(userId, id, updates) {
   if (updates.issuer !== undefined) payload.issuer = updates.issuer
   if (updates.group_name !== undefined) payload.group_name = updates.group_name
   if (updates.logo !== undefined) payload.logo = updates.logo
+  // PostgREST rejects an empty UPDATE.
+  if (Object.keys(payload).length === 0) return getAccountById(userId, id)
 
   const { data, error } = await sb
     .from('accounts')
@@ -302,35 +306,38 @@ export async function listGroupsByUser(userId) {
   }
 }
 
+const isMissingTable = (err) =>
+  err?.code === '42P01' || err?.message?.includes('does not exist')
+
+const serverGroupId = () => 'grp_' + randomBytes(9).toString('base64url')
+
 export async function createGroup(userId, group) {
   if (mocks.createGroup) return mocks.createGroup(userId, group)
   const sb = getSupabase()
-  const safeId =
-    (typeof group.id === 'string' && /^[A-Za-z0-9_:-]{1,64}$/.test(group.id) && group.id) ||
-    'grp_' +
-      Date.now().toString(36) +
-      '_' +
-      Math.random().toString(36).slice(2, 8)
+  const clientId =
+    typeof group.id === 'string' && /^[A-Za-z0-9_:-]{1,64}$/.test(group.id) ? group.id : null
   const payload = {
-    id: safeId,
+    id: clientId || serverGroupId(),
     user_id: userId,
     name: group.name.trim(),
     logo: group.logo || '',
   }
+  const insert = (row) => sb.from('groups').insert(row).select().single()
   try {
-    const { data, error } = await sb
-      .from('groups')
-      .insert(payload)
-      .select()
-      .single()
+    let { data, error } = await insert(payload)
+    // 23505: the client-chosen id is already taken (ids are global) — use ours.
+    if (error?.code === '23505' && clientId) {
+      payload.id = serverGroupId()
+      ;({ data, error } = await insert(payload))
+    }
     if (!error) return data
-    if (error.code === '42P01' || error.message?.includes('does not exist')) {
+    if (isMissingTable(error)) {
       // Table doesn't exist yet; return payload as fallback
       return { ...payload, created_at: new Date().toISOString() }
     }
     throw error
   } catch (err) {
-    if (err.code === '42P01' || err.message?.includes('does not exist')) {
+    if (isMissingTable(err)) {
       return { ...payload, created_at: new Date().toISOString() }
     }
     throw err
@@ -356,6 +363,8 @@ export async function updateGroup(userId, groupId, updates) {
   }
 
   const sb = getSupabase()
+  // A rename must carry over to accounts, which reference the group by name.
+  const previous = payload.name !== undefined ? await getGroupById(userId, groupId) : null
   try {
     const { data, error } = await sb
       .from('groups')
@@ -364,7 +373,19 @@ export async function updateGroup(userId, groupId, updates) {
       .eq('id', groupId)
       .select()
       .single()
-    if (!error) return data
+    if (!error) {
+      if (previous?.name && previous.name !== payload.name) {
+        const { error: accErr } = await sb
+          .from('accounts')
+          .update({ group_name: payload.name })
+          .eq('user_id', userId)
+          .eq('group_name', previous.name)
+        if (accErr && accErr.code !== '42703' && !accErr.message?.includes('column')) {
+          throw accErr
+        }
+      }
+      return data
+    }
     if (error.code === '42P01' || error.message?.includes('does not exist')) {
       return { id: groupId, ...payload }
     }
@@ -380,26 +401,24 @@ export async function updateGroup(userId, groupId, updates) {
 export async function deleteGroup(userId, groupId, oldName) {
   if (mocks.deleteGroup) return mocks.deleteGroup(userId, groupId, oldName)
   const sb = getSupabase()
-  try {
-    await sb
-      .from('groups')
-      .delete()
-      .eq('user_id', userId)
-      .eq('id', groupId)
-  } catch (err) {
-    // ignore if table doesn't exist
-  }
+  // supabase-js reports failures in the result rather than throwing, so check
+  // `error` explicitly; only a missing table / column is safe to ignore.
+  const { error: groupErr } = await sb
+    .from('groups')
+    .delete()
+    .eq('user_id', userId)
+    .eq('id', groupId)
+  if (groupErr && !isMissingTable(groupErr)) throw groupErr
 
   // Also clear group assignment on all accounts belonging to this group
   if (oldName) {
-    try {
-      await sb
-        .from('accounts')
-        .update({ group_name: '' })
-        .eq('user_id', userId)
-        .eq('group_name', oldName)
-    } catch (err) {
-      // ignore column error if column does not exist
+    const { error: accErr } = await sb
+      .from('accounts')
+      .update({ group_name: '' })
+      .eq('user_id', userId)
+      .eq('group_name', oldName)
+    if (accErr && accErr.code !== '42703' && !accErr.message?.includes('column')) {
+      throw accErr
     }
   }
 }

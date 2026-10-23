@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from 'react'
-import { createPortal } from 'react-dom'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import {
   faCheck,
@@ -12,6 +11,8 @@ import {
   faCopy,
 } from '@fortawesome/free-solid-svg-icons'
 import { ServiceLogo } from '../lib/icons.jsx'
+import { copyText } from '../lib/clipboard.js'
+import Modal from './Modal.jsx'
 
 // Step-2 typed confirmation phrase per delete target.
 // Groups require `sudo rm group`, single 2FA accounts require `sudo rm 2fa`.
@@ -37,6 +38,9 @@ export default function DeleteModal({
   const [confirmText, setConfirmText] = useState('')
   const [copiedPhrase, setCopiedPhrase] = useState(false)
   const inputRef = useRef(null)
+  const copiedTimer = useRef(0)
+
+  useEffect(() => () => clearTimeout(copiedTimer.current), [])
 
   // Reset whenever modal opens
   useEffect(() => {
@@ -49,9 +53,9 @@ export default function DeleteModal({
 
   // Auto-focus input when reaching step 2
   useEffect(() => {
-    if (step === 2) {
-      setTimeout(() => inputRef.current?.focus(), 90)
-    }
+    if (step !== 2) return undefined
+    const t = setTimeout(() => inputRef.current?.focus(), 90)
+    return () => clearTimeout(t)
   }, [step])
 
   if (!isOpen) return null
@@ -74,21 +78,21 @@ export default function DeleteModal({
 
   // Clicking the red phrase chip copies it so the user can paste it below
   async function copyPhrase() {
-    try {
-      await navigator.clipboard.writeText(CONFIRM_PHRASE)
+    if (await copyText(CONFIRM_PHRASE)) {
       setCopiedPhrase(true)
-      setTimeout(() => setCopiedPhrase(false), 1600)
-    } catch (err) {
-      console.error('Phrase copy failed', err)
+      clearTimeout(copiedTimer.current)
+      copiedTimer.current = setTimeout(() => setCopiedPhrase(false), 1600)
     }
   }
 
-  const modal = (
-    <div className="modal-backdrop" onClick={onCancel} style={{ zIndex: 1200 }}>
-      <div
+  return (
+      <Modal
+        onClose={onCancel}
+        dismissible={!loading}
+        ariaLabel={customTitle || (isGroupDelete ? 'Delete group' : 'Delete 2FA account')}
         className="modal delete-modal"
-        onClick={(e) => e.stopPropagation()}
         style={{ maxWidth: 460, border: '1px solid rgba(239, 68, 68, 0.2)' }}
+        backdropStyle={{ zIndex: 1200 }}
       >
         {/* Step Indicator */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 18 }}>
@@ -357,9 +361,6 @@ export default function DeleteModal({
             </div>
           </form>
         )}
-      </div>
-    </div>
+      </Modal>
   )
-
-  return createPortal(modal, document.body)
 }

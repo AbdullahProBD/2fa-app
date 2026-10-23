@@ -31,34 +31,69 @@ function getCsrfToken() {
 // `2fa_csrf` cookie AND return the value in the JSON body. The body value
 // is the most reliable source because cookie writes from this endpoint may
 // race with the very request we are about to retry.
-async function refreshCsrfToken() {
-  const res = await fetch('/api/csrf', {
-    credentials: 'include',
-    headers: { Accept: 'application/json' },
-  })
-  if (!res.ok) {
-    throw new Error(`Failed to refresh CSRF token (HTTP ${res.status})`)
+let csrfRefresh = null
+function refreshCsrfToken() {
+  // Concurrent 403s share one refresh instead of racing each other's cookies.
+  if (!csrfRefresh) {
+    csrfRefresh = (async () => {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+      try {
+        const res = await fetch('/api/csrf', {
+          credentials: 'same-origin',
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        })
+        if (!res.ok) {
+          throw new Error(`Failed to refresh CSRF token (HTTP ${res.status})`)
+        }
+        const data = await res.json().catch(() => ({}))
+        if (data && typeof data.csrfToken === 'string' && data.csrfToken) {
+          csrfCache = data.csrfToken
+        }
+        // Also pick up whatever cookie the server just set, in case the body
+        // field was missing.
+        getCsrfToken()
+        return csrfCache
+      } finally {
+        clearTimeout(timer)
+      }
+    })().finally(() => {
+      csrfRefresh = null
+    })
   }
-  const data = await res.json().catch(() => ({}))
-  if (data && typeof data.csrfToken === 'string' && data.csrfToken) {
-    csrfCache = data.csrfToken
+  return csrfRefresh
+}
+
+// Called once when any request other than login comes back 401 (session
+// expired / revoked) so the app can drop back to the login screen.
+let unauthorizedHandler = null
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = typeof fn === 'function' ? fn : null
+}
+
+// Never surface a raw HTML error page (proxy 502s etc.) or a megabyte of text
+// to the user; only short plain messages are shown as-is.
+function errorMessageFrom(data, status) {
+  const msg = data && typeof data === 'object' ? data.error : ''
+  if (typeof msg === 'string' && msg.trim() && msg.length <= 300 && !/<\/?[a-z][\s\S]*>/i.test(msg)) {
+    return msg.trim()
   }
-  // Also try to pick up whatever cookie the server just set, in case the
-  // body field was missing.
-  getCsrfToken()
-  return csrfCache
+  return `Request failed (HTTP ${status})`
 }
 
 async function request(path, options = {}) {
+  const { headers: extraHeaders, ...fetchOptions } = options
   const method = (options.method || 'GET').toUpperCase()
   const isWrite = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS'
 
   const buildHeaders = () => {
     const headers = {
+      Accept: 'application/json',
       ...(options.body && !(options.body instanceof FormData)
         ? { 'Content-Type': 'application/json' }
         : {}),
-      ...(options.headers || {}),
+      ...(extraHeaders || {}),
     }
     if (isWrite) {
       const token = getCsrfToken()
@@ -71,11 +106,12 @@ async function request(path, options = {}) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
     try {
+      // Spread options first so our headers/signal/credentials always win.
       const res = await fetch(path, {
-        credentials: 'include',
+        ...fetchOptions,
+        credentials: 'same-origin',
         headers: buildHeaders(),
         signal: controller.signal,
-        ...options,
       })
       const text = await res.text()
       let data
@@ -85,6 +121,14 @@ async function request(path, options = {}) {
         data = { error: text }
       }
       return { res, data }
+    } catch (e) {
+      const err = new Error(
+        e && e.name === 'AbortError'
+          ? 'The server took too long to respond. Please try again.'
+          : 'Network error — could not reach the server.'
+      )
+      err.status = 0
+      throw err
     } finally {
       clearTimeout(timer)
     }
@@ -98,6 +142,7 @@ async function request(path, options = {}) {
   if (
     isWrite &&
     res.status === 403 &&
+    data &&
     typeof data === 'object' &&
     typeof data.error === 'string' &&
     data.error.toLowerCase().includes('csrf')
@@ -111,11 +156,15 @@ async function request(path, options = {}) {
   }
 
   if (!res.ok) {
-    const err = new Error(data.error || `HTTP ${res.status}`)
+    if (res.status === 401 && path !== '/api/login') {
+      csrfCache = ''
+      if (unauthorizedHandler) unauthorizedHandler()
+    }
+    const err = new Error(errorMessageFrom(data, res.status))
     err.status = res.status
     throw err
   }
-  return data
+  return data && typeof data === 'object' ? data : {}
 }
 
 // Exposed so the Login page can seed the in-memory cache from the value the
@@ -166,7 +215,7 @@ export const api = {
   },
   // Updated: GET now uses REST path param /api/totp/:id
   getCode(id, counter) {
-    const q = counter != null ? `?counter=${counter}` : ''
+    const q = counter != null ? `?counter=${encodeURIComponent(counter)}` : ''
     return request(`/api/totp/${encodeURIComponent(id)}${q}`)
   },
   // GET /api/totp — batch fetch all live codes

@@ -14,7 +14,7 @@ import qrParseRouter from './routes/qr-parse.js'
 import modeRouter from './routes/mode.js'
 import groupsRouter from './routes/groups.js'
 import csrfRouter from './routes/csrf.js'
-import { requireSession } from './lib/auth.js'
+import { requireSession, requireCsrfIfSession } from './lib/auth.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const DIST_DIR = join(__dirname, '..', 'dist')
@@ -29,6 +29,18 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean)
 
 const app = express()
+
+// Behind Vercel (or another reverse proxy) req.ip would otherwise be the proxy's
+// address, putting every visitor in one rate-limit bucket — an attacker could
+// then lock the admin out. Vercel sets X-Forwarded-For itself, so one hop is
+// trustworthy there. Elsewhere, set TRUST_PROXY (hop count) only if you run
+// behind a proxy; trusting it blindly would let clients spoof their IP.
+const TRUST_PROXY = process.env.TRUST_PROXY
+if (TRUST_PROXY !== undefined && TRUST_PROXY !== '') {
+  app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? parseInt(TRUST_PROXY, 10) : false)
+} else if (isServerless) {
+  app.set('trust proxy', 1)
+}
 
 // Disable the X-Powered-By header (information leak)
 app.disable('x-powered-by')
@@ -59,11 +71,12 @@ app.use(
         // 'self' does not cover blob: — without it every QR image upload fails
         // with "Failed to load image for scanning".
         imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
-        connectSrc: ["'self'", 'https://*.supabase.co', 'https://*.vercel-insights.com', 'https://*.vercel-analytics.com', 'https://va.vercel-scripts.com'],
+        connectSrc: ["'self'", 'https://*.vercel-insights.com', 'https://*.vercel-analytics.com', 'https://va.vercel-scripts.com'],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],
+        frameAncestors: ["'none'"],
       },
     },
     referrerPolicy: { policy: 'no-referrer' },
@@ -96,7 +109,9 @@ if (ALLOWED_ORIGINS.length > 0) {
       origin: (origin, cb) => {
         if (!origin) return cb(null, true)
         if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
-        return cb(new Error('CORS: origin not allowed'))
+        const err = new Error('CORS: origin not allowed')
+        err.status = 403
+        return cb(err)
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -105,10 +120,34 @@ if (ALLOWED_ORIGINS.length > 0) {
   )
 }
 
+// ── API hardening ────────────────────────────────────────────────────────────
+// Responses carry codes and vault metadata — never let a browser or CDN cache them.
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store')
+  next()
+})
+
+// Reject cross-origin state-changing requests outright. SameSite and CSRF
+// tokens already block them; this stops them before any handler (incl. login) runs.
+// Skipped in dev: Vite's proxy rewrites Host (changeOrigin), so Origin never matches.
+app.use('/api', (req, res, next) => {
+  if (isDev || req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next()
+  const origin = req.headers.origin
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) return next()
+  let sameHost = false
+  try {
+    sameHost = new URL(origin).host === req.headers.host
+  } catch {
+    // malformed Origin → treated as cross-origin
+  }
+  if (sameHost) return next()
+  return res.status(403).json({ error: 'Cross-origin request blocked' })
+})
+
 // ── Body parsers ─────────────────────────────────────────────────────────────
-// M1 FIX: 2MB body limit prevents large payload DoS
+// 2MB body limit prevents large payload DoS. JSON only: a urlencoded parser
+// would let a third-party <form> POST reach the API without a CORS preflight.
 app.use(express.json({ limit: '2mb' }))
-app.use(express.urlencoded({ extended: false, limit: '2mb' }))
 
 // ── H1 FIX: Rate limiting on the login endpoint ───────────────────────────────
 const loginLimiter = rateLimit({
@@ -118,6 +157,15 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
   skipSuccessfulRequests: true, // only count failed attempts
+})
+
+// Coarse per-IP ceiling for the whole API (unauthenticated floods included)
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down.' },
 })
 
 // Global write rate limit to slow down enumeration / DoS
@@ -130,15 +178,17 @@ const writeLimiter = rateLimit({
 })
 
 // ── Public probes (no auth) ──────────────────────────────────────────────────
+app.use('/api', apiLimiter)
 app.use('/api/mode', modeRouter)
 app.use('/api/login', loginLimiter, loginRouter)
 
 // ── Authenticated routes: session + CSRF enforced ────────────────────────────
+// Logout is handled before requireSession so an expired session can still clear its cookies.
+app.use('/api/logout', requireCsrfIfSession, logoutRouter)
 app.use('/api', requireSession)
 // GET /api/csrf issues a fresh CSRF token — must NOT itself require a
 // matching CSRF header (chicken-and-egg), but does require a valid session.
 app.use('/api/csrf', csrfRouter)
-app.use('/api/logout', logoutRouter)
 app.use('/api/accounts', writeLimiter, accountsRouter)
 app.use('/api/totp', totpRouter)
 app.use('/api/qr-parse', writeLimiter, qrParseRouter)
@@ -154,14 +204,12 @@ if (!isDev) {
   if (existsSync(DIST_DIR)) {
     app.use(
       express.static(DIST_DIR, {
-        // Hash-based asset filenames can be cached aggressively
-        maxAge: '1y',
-        immutable: true,
+        // Only Vite's hash-named /assets files are safe to cache for a year
         setHeaders(res, filePath) {
-          if (filePath.endsWith('index.html')) {
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-            res.setHeader('Pragma', 'no-cache')
-            res.setHeader('Expires', '0')
+          if (/[\\/]assets[\\/]/.test(filePath)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+          } else {
+            res.setHeader('Cache-Control', 'no-cache')
           }
         },
       })
@@ -180,11 +228,12 @@ if (!isDev) {
 
 // ── Global error handler ──────────────────────────────────────────────────────
 app.use((err, req, res, _next) => {
-  if (process.env.NODE_ENV !== 'production') {
-    console.error('[server] unhandled error:', err?.message)
-  }
+  // body-parser / CORS errors carry a 4xx status; anything else is a 500.
+  const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 500 ? err.status : 500
+  if (status === 500) console.error('[server] unhandled error:', err?.message)
   if (res.headersSent) return
-  res.status(500).json({ error: 'Internal server error' })
+  const messages = { 400: 'Bad request', 403: 'Forbidden', 413: 'Payload too large' }
+  res.status(status).json({ error: status === 500 ? 'Internal server error' : messages[status] || 'Bad request' })
 })
 
 // Only start the listener when run directly. On serverless platforms

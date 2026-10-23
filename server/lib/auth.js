@@ -26,7 +26,7 @@ function getAesKey() {
 export function wrapVaultKeyForSession(vaultKey) {
   const aesKey = Buffer.from(getAesKey())
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv)
+  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 })
   const ct = Buffer.concat([cipher.update(vaultKey), cipher.final()])
   const tag = cipher.getAuthTag()
   return {
@@ -43,7 +43,8 @@ export function unwrapVaultKeyFromSession(wrapped) {
     const iv = Buffer.from(wrapped.v, 'base64')
     const ct = Buffer.from(wrapped.c, 'base64')
     const tag = Buffer.from(wrapped.t, 'base64')
-    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, iv)
+    if (iv.length !== 12 || tag.length !== 16) return null
+    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 })
     decipher.setAuthTag(tag)
     return Buffer.concat([decipher.update(ct), decipher.final()])
   } catch {
@@ -51,34 +52,54 @@ export function unwrapVaultKeyFromSession(wrapped) {
   }
 }
 
-export function signSession({ userId, vaultKey }) {
-  return jwt.sign(
+// Creates a session and the CSRF token bound to it. The token is an HMAC of the
+// session's random `sid`, so it can be re-derived from any valid session (see
+// /api/csrf) but cannot be forged by someone who can only set cookies.
+export function createSession({ userId, vaultKey }) {
+  const sid = crypto.randomBytes(16).toString('base64url')
+  const token = jwt.sign(
     {
       uid: userId,
+      sid,
       vk: wrapVaultKeyForSession(vaultKey),
     },
     getSessionSecret(),
-    { expiresIn: SESSION_TTL_SECONDS }
+    { algorithm: 'HS256', expiresIn: SESSION_TTL_SECONDS }
   )
+  return { token, csrfToken: csrfTokenForSid(sid) }
+}
+
+export function signSession(args) {
+  return createSession(args).token
 }
 
 export function verifySession(token) {
   try {
-    return jwt.verify(token, getSessionSecret())
+    const claims = jwt.verify(token, getSessionSecret(), { algorithms: ['HS256'] })
+    if (typeof claims?.uid !== 'string' || typeof claims.sid !== 'string') return null
+    return claims
   } catch {
     return null
   }
 }
 
-// ── CSRF protection: Double-Submit Cookie pattern ────────────────────────────
-// On login we set a CSRF cookie (readable by JS) and embed the same value in
-// the session. The browser then must echo the value in a header on every
-// state-changing request. The session cookie is HttpOnly + SameSite=Strict
-// (server-to-browser only). The CSRF cookie is intentionally NOT HttpOnly
-// (JS must read it) and uses SameSite=Lax so that it survives Vercel preview
-// redirects, embedded iframe scenarios, and Safari ITP drops. Real CSRF
-// protection still comes from the fact that the header is not auto-sent on
-// cross-site requests; the cookie being Lax doesn't weaken this.
+function csrfTokenForSid(sid) {
+  const key = Buffer.from(
+    crypto.hkdfSync('sha256', getSessionSecret(), 'session-csrf', '', 32)
+  )
+  return crypto.createHmac('sha256', key).update(sid).digest('base64url')
+}
+
+export function csrfTokenForSession(session) {
+  return csrfTokenForSid(session.sid)
+}
+
+// ── CSRF protection: session-bound double-submit ─────────────────────────────
+// The CSRF token is derived from the session (see createSession). State-changing
+// requests must send it in the X-CSRF-Token header AND the readable 2fa_csrf
+// cookie, and it must match the one derived from the session cookie — so a
+// cookie-injection attacker (e.g. from a sibling subdomain) who sets both
+// cookies still fails, because they cannot compute the HMAC.
 function generateCsrfToken() {
   return crypto.randomBytes(24).toString('base64url')
 }
@@ -103,8 +124,7 @@ export function buildCookie(token) {
   return parts.join('; ')
 }
 
-export function buildCsrfCookie() {
-  const token = generateCsrfToken()
+export function buildCsrfCookie(token = generateCsrfToken()) {
   const parts = [
     `${CSRF_COOKIE_NAME}=${token}`,
     'Path=/',
@@ -144,8 +164,11 @@ export function readCookieFromReq(req, name = COOKIE_NAME) {
   const raw = req.headers?.cookie || ''
   if (!raw) return null
   for (const part of raw.split(';')) {
-    const [k, ...rest] = part.trim().split('=')
-    if (k === name) return rest.join('=')
+    const eq = part.indexOf('=')
+    if (eq === -1) continue
+    if (part.slice(0, eq).trim() !== name) continue
+    const value = part.slice(eq + 1).trim()
+    return value || null
   }
   return null
 }
@@ -176,24 +199,37 @@ export function getUserIdFromReq(req) {
   return session?.uid || null
 }
 
+function csrfValid(req, session) {
+  const csrfCookie = readCookieFromReq(req, CSRF_COOKIE_NAME)
+  const csrfHeader = req.headers[CSRF_HEADER_NAME]
+  return (
+    typeof csrfHeader === 'string' &&
+    safeEqual(csrfHeader, csrfCookie) &&
+    safeEqual(csrfHeader, csrfTokenForSession(session))
+  )
+}
+
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+
 // ── Middleware: require a valid session and a matching CSRF token on
-//    any state-changing request. Bypass for GET/HEAD/OPTIONS and for the
-//    login route (no session yet) and for the /api/mode probe route.
+//    any state-changing request.
 export function requireSession(req, res, next) {
   const session = getSession(req)
-  if (!session || !session.uid) {
+  if (!session) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
-  const method = req.method.toUpperCase()
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+  if (SAFE_METHODS.has(req.method.toUpperCase()) || csrfValid(req, session)) {
     return next()
   }
-  const csrfCookie = readCookieFromReq(req, CSRF_COOKIE_NAME)
-  const csrfHeader =
-    req.headers[CSRF_HEADER_NAME] ||
-    req.headers[CSRF_HEADER_NAME.toUpperCase()]
-  if (!csrfCookie || !csrfHeader || !safeEqual(csrfCookie, csrfHeader)) {
-    return res.status(403).json({ error: 'CSRF token missing or invalid' })
+  return res.status(403).json({ error: 'CSRF token missing or invalid' })
+}
+
+// For logout: with no valid session there is nothing to protect, so let the
+// request through to clear stale cookies; with a valid one, CSRF still applies.
+export function requireCsrfIfSession(req, res, next) {
+  const session = getSession(req)
+  if (!session || SAFE_METHODS.has(req.method.toUpperCase()) || csrfValid(req, session)) {
+    return next()
   }
-  next()
+  return res.status(403).json({ error: 'CSRF token missing or invalid' })
 }

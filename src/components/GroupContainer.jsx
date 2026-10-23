@@ -51,9 +51,18 @@ export default function GroupContainer({
     }
   }
 
-  const isCustomGroup = Boolean(group.id && group.id !== 'ungrouped' && group.id !== 'all')
+  // Auto-derived sections have no stored group, so they cannot be renamed/deleted.
+  const isCustomGroup = Boolean(
+    group.id &&
+      group.id !== 'ungrouped' &&
+      group.id !== 'all' &&
+      !String(group.id).startsWith('grp_auto_')
+  )
   const reorderable =
     Boolean(onMoveAccount) && accounts.length > 0 && !collapsed && editMode
+
+  // The synthetic "Ungrouped" section must add accounts with no group.
+  const addTarget = group.id === 'ungrouped' ? '' : group.name
 
   function move(idx, dir) {
     const target = idx + dir
@@ -83,8 +92,9 @@ export default function GroupContainer({
           {/* Add account directly to this group */}
           <button
             className="group-action-btn"
-            onClick={() => onAddAccountToGroup(group.name)}
+            onClick={() => onAddAccountToGroup(addTarget)}
             title={`Add account to ${group.name}`}
+            aria-label={`Add account to ${group.name}`}
           >
             <FontAwesomeIcon icon={faPlus} style={{ fontSize: 14 }} />
           </button>
@@ -95,6 +105,7 @@ export default function GroupContainer({
               className="group-action-btn"
               onClick={() => setShowRenameModal(true)}
               title="Rename Group"
+              aria-label={`Rename group ${group.name}`}
             >
               <FontAwesomeIcon icon={faPen} style={{ fontSize: 13 }} />
             </button>
@@ -106,6 +117,7 @@ export default function GroupContainer({
               className="group-action-btn btn-danger"
               onClick={() => setShowDeleteModal(true)}
               title="Delete Group"
+              aria-label={`Delete group ${group.name}`}
             >
               <FontAwesomeIcon icon={faTrashCan} style={{ fontSize: 13 }} />
             </button>
@@ -141,6 +153,7 @@ export default function GroupContainer({
             className="group-action-btn"
             onClick={toggleCollapsed}
             title={collapsed ? 'Expand group' : 'Collapse group'}
+            aria-label={`${collapsed ? 'Expand' : 'Collapse'} group ${group.name}`}
             aria-expanded={!collapsed}
           >
             <FontAwesomeIcon
@@ -156,15 +169,21 @@ export default function GroupContainer({
       </div>
 
       {/* Group Items — smooth slide expand/collapse via grid-rows animation */}
-      <div className={`group-collapse ${collapsed ? 'collapsed' : ''}`} aria-hidden={collapsed}>
+      {/* `inert` keeps collapsed cards out of the tab order and a11y tree */}
+      <div
+        className={`group-collapse ${collapsed ? 'collapsed' : ''}`}
+        aria-hidden={collapsed}
+        inert={collapsed ? '' : undefined}
+      >
         <div className="group-collapse-inner">
           <div className="group-items">
           {accounts.length === 0 ? (
             <div className="group-empty-hint">
               No accounts in this group yet.{' '}
               <button
+                type="button"
                 className="btn-link"
-                onClick={() => onAddAccountToGroup(group.name)}
+                onClick={() => onAddAccountToGroup(addTarget)}
               >
                 <FontAwesomeIcon icon={faPlus} style={{ fontSize: 11 }} /> Add one
               </button>

@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react'
-import { createPortal } from 'react-dom'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faPlus } from '@fortawesome/free-solid-svg-icons'
-import { BRAND_ICONS, ServiceLogo, detectService } from '../lib/icons.jsx'
+import { getBrand, ServiceLogo, detectService } from '../lib/icons.jsx'
 import {
   getCustomGroups,
   createCustomGroup,
@@ -12,6 +11,7 @@ import {
 import { api } from '../lib/api.js'
 import IconPickerModal from './IconPickerModal.jsx'
 import GroupModal from './GroupModal.jsx'
+import Modal from './Modal.jsx'
 import Select from './Select.jsx'
 
 export default function EditAccountModal({
@@ -42,14 +42,16 @@ export default function EditAccountModal({
     }
   }, [isOpen, account])
 
-  // Reactively track groups created or renamed
+  // Reactively track groups created or renamed. Only while open: every account
+  // card mounts one of these, so an always-on subscription re-parses
+  // localStorage once per card on each change.
   useEffect(() => {
+    if (!isOpen) return undefined
     setCustomGroups(getCustomGroups())
-    const unsubscribe = subscribeGroups(() => {
+    return subscribeGroups(() => {
       setCustomGroups(getCustomGroups())
     })
-    return unsubscribe
-  }, [])
+  }, [isOpen])
 
   if (!isOpen || !account) return null
 
@@ -60,7 +62,7 @@ export default function EditAccountModal({
   function handleIssuerChange(e) {
     const val = e.target.value
     setIssuer(val)
-    if (!logo || BRAND_ICONS[logo]) {
+    if (!logo || getBrand(logo)) {
       const auto = detectService(val)
       if (auto) setLogo(auto)
     }
@@ -69,6 +71,7 @@ export default function EditAccountModal({
   async function submit(e) {
     e.preventDefault()
     setErr('')
+    if (loading) return
     if (!label.trim()) {
       setErr('Account label is required')
       return
@@ -94,19 +97,23 @@ export default function EditAccountModal({
       onUpdated(merged)
       onClose()
     } catch (e) {
-      console.error(e)
-      setAccountMeta(account.id, { group, logo })
-      onUpdated({ ...account, ...payload, group, logo })
-      onClose()
+      // Keep the dialog open and local state untouched so the UI never shows
+      // changes the server rejected (or never received).
+      setErr(e.message || 'Failed to save changes')
     } finally {
       setLoading(false)
     }
   }
 
-  const modal = (
+  return (
     <>
-      <div className="modal-backdrop" onClick={onClose} style={{ zIndex: 1000 }}>
-        <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 480 }}>
+      <Modal
+        onClose={onClose}
+        dismissible={!loading}
+        ariaLabel="Edit 2FA account"
+        style={{ maxWidth: 480 }}
+        backdropStyle={{ zIndex: 1000 }}
+      >
           <h2>Edit 2FA Account</h2>
 
           <form onSubmit={submit}>
@@ -115,13 +122,22 @@ export default function EditAccountModal({
               <label className="label">Icon / Logo</label>
               <div
                 className="icon-picker-trigger"
+                role="button"
+                tabIndex={0}
+                aria-label="Choose icon"
                 onClick={() => setShowIconPicker(true)}
+                onKeyDown={(e) => {
+                  if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                    e.preventDefault()
+                    setShowIconPicker(true)
+                  }
+                }}
               >
                 <div className="icon-picker-trigger-left">
                   <ServiceLogo logo={logo} issuer={issuer} label={label} size={42} />
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 600 }}>
-                      {logo && BRAND_ICONS[logo] ? BRAND_ICONS[logo].name : logo ? 'Custom Logo' : 'Auto Initials'}
+                      {logo && getBrand(logo) ? getBrand(logo).name : logo ? 'Custom Logo' : 'Auto Initials'}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--muted)' }}>
                       Click to choose from 70+ logos or upload
@@ -136,8 +152,9 @@ export default function EditAccountModal({
 
             <div className="row">
               <div className="field">
-                <label className="label">Label / Name *</label>
+                <label className="label" htmlFor="edit-account-label">Label / Name *</label>
                 <input
+                  id="edit-account-label"
                   className="input"
                   value={label}
                   onChange={(e) => setLabel(e.target.value)}
@@ -145,8 +162,9 @@ export default function EditAccountModal({
                 />
               </div>
               <div className="field">
-                <label className="label">Issuer (Service)</label>
+                <label className="label" htmlFor="edit-account-issuer">Issuer (Service)</label>
                 <input
+                  id="edit-account-issuer"
                   className="input"
                   value={issuer}
                   onChange={handleIssuerChange}
@@ -188,7 +206,7 @@ export default function EditAccountModal({
               </div>
             </div>
 
-            {err && <div className="error">{err}</div>}
+            {err && <div className="error" role="alert">{err}</div>}
 
             <div className="modal-actions" style={{ marginTop: 20 }}>
               <button type="button" className="btn btn-ghost" onClick={onClose} disabled={loading}>
@@ -199,8 +217,7 @@ export default function EditAccountModal({
               </button>
             </div>
           </form>
-        </div>
-      </div>
+      </Modal>
 
       {/* Dedicated Icon Picker Modal */}
       <IconPickerModal
@@ -227,6 +244,4 @@ export default function EditAccountModal({
       )}
     </>
   )
-
-  return createPortal(modal, document.body)
 }
